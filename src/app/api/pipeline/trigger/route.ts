@@ -24,25 +24,12 @@ export async function POST(request: NextRequest) {
             executionArn,
             message: "Pipeline started successfully"
         });
-    }catch (error: any) {
-        console.error("Pipeline Trigger Error:", error);
 
+    } catch (error: any) {
+        console.error("Pipeline Trigger Error:", error);
         return NextResponse.json(
-            {
-                success: false,
-                error: error.message || "Pipeline triggered with warnings",
-            },
-            {
-                status: 200, // 🔥 IMPORTANT: NOT 500
-            }
+            { error: error.message || "Failed to start pipeline" },
+            { status: 500 }
         );
     }
-
-    // } catch (error: any) {
-    //     console.error("Pipeline Trigger Error:", error);
-    //     return NextResponse.json(
-    //         { error: error.message || "Failed to start pipeline" },
-    //         { status: 500 }
-    //     );
-    // }
 }
