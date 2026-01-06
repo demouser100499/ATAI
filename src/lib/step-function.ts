@@ -6,26 +6,26 @@ import { parquetReadObjects } from "hyparquet";
 
 const sfnClient = new SFNClient({
     region: process.env.AWS_REGION || "eu-north-1",
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    },
+    // credentials: {
+    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+    // },
 });
 
 const s3Client = new S3Client({
     region: process.env.AWS_REGION || "eu-north-1",
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    },
+    // credentials: {
+    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+    // },
 });
 
 const lambdaClient = new LambdaClient({
     region: process.env.AWS_REGION || "eu-north-1",
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    },
+    // credentials: {
+    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+    // },
 });
 
 const STATE_MACHINE_ARN = process.env.STEP_FUNCTION_ARN;
