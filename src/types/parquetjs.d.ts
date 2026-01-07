@@ -6,6 +6,6 @@ declare module 'parquetjs' {
     }
 
     export class ParquetCursor {
-        next(): Promise<any>;
+        next(): Promise<unknown>;
     }
 }

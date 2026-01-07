@@ -17,8 +17,8 @@ export async function POST(request: NextRequest) {
             success: true,
             stopDate
         });
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error("Stop Pipeline Error:", error);
-        return NextResponse.json({ error: error.message }, { status: 500 });
+        return NextResponse.json({ error: (error as Error).message }, { status: 500 });
     }
 }

@@ -18,10 +18,10 @@ export async function GET(request: NextRequest) {
 
         return NextResponse.json(status);
 
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error("Pipeline Status Error:", error);
         return NextResponse.json(
-            { error: error.message || "Failed to get status" },
+            { error: (error as Error).message || "Failed to get status" },
             { status: 500 }
         );
     }
