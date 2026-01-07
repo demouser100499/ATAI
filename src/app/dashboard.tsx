@@ -121,6 +121,47 @@ const Dashboard = () => {
     };
   }, [showTrendDropdown]);
 
+  // Clear results and filters when searching mode changes
+  useEffect(() => {
+    // Clear Results & Status
+    setProducts([]);
+    setError(null);
+    setPipelineStatus('IDLE');
+    setExecutionArn(null);
+    setStatusMessage('');
+    setIsPreliminary(false);
+
+    // Clear Validation Errors
+    setKeywordSearchError('');
+    setLocationError('');
+    setVariantLimitMaxError('');
+    setResultsCapError('');
+    setTrendPeriodError('');
+
+    // Reset All Filters to Defaults
+    setKeywordSearch('');
+    setProductCategory('All categories');
+    setKwpMonthlySearches('');
+    setBlacklistedWords('');
+    setGoogleTrendScore(0);
+    setPriceMin(0);
+    setPriceMax(100);
+    setReviewsMin(0);
+    setReviewsMax(100);
+    setRatingFilter(0);
+    setFcl(0.0);
+    setCostBelow(0.0);
+    setMoq('');
+    setAlibabaRating(0);
+    setVerifiedSupplier(false);
+
+    // Reset Pipeline-specific configs
+    setTrendPeriod('');
+    setVariantLimitMax('');
+    setResultsCap('');
+    setLocation(''); // Resetting location too for complete isolation
+  }, [searchingMode]);
+
   const toTitleCase = (str: string): string => {
     if (!str) return str;
     return str.toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase());
@@ -175,113 +216,6 @@ const Dashboard = () => {
 
 
   // Pipeline workflow functions
-  const triggerPipeline = async () => {
-    try {
-      setPipelineStatus('STARTING');
-      setStatusMessage('STARTING');
-
-      const searchModeMap: Record<string, string> = {
-        'MANUAL': 'manual_search',
-        'CATEGORY BASED': 'category_search',
-        'ATAI AUTO': 'auto_search'
-      };
-
-      const payload = {
-        keyword: keywordSearch,
-        search_mode: searchModeMap[searchingMode] || 'manual_search',
-        filters: {
-          location: getCountryCode(location),
-          category: productCategory,
-          trendPeriod: parseInt(trendPeriod),
-          variantLimitMax: parseInt(variantLimitMax),
-          size: parseInt(resultsCap),
-          amazonFilters: amazonFilters,
-          alibabaFilters: alibabaFilters
-        }
-      };
-
-      const response = await fetch('/api/pipeline/trigger', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await response.json();
-
-      if (data.success && data.executionArn) {
-        setExecutionArn(data.executionArn);
-        setPipelineStatus('POLLING');
-        setStatusMessage('RUNNING');
-        startStatusPolling(data.executionArn);
-      } else {
-        throw new Error(data.message || 'Failed to start pipeline');
-      }
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to start pipeline';
-      setError(errorMessage);
-      setPipelineStatus('FAILED');
-      setStatusMessage(`Error: ${errorMessage}`);
-      setActiveSearch(false); // Reset toggle on error
-    }
-  };
-
-  const startStatusPolling = (arn: string) => {
-    const pollInterval = setInterval(async () => {
-      try {
-        const response = await fetch(`/api/pipeline/status?arn=${encodeURIComponent(arn)}`);
-        const data = await response.json();
-
-        // Only show simple status
-        if (data.status === 'RUNNING' || data.status === 'PENDING') {
-          setStatusMessage('RUNNING');
-        } else if (data.status === 'SUCCEEDED') {
-          clearInterval(pollInterval);
-          setPipelineStatus('COMPLETED');
-          setStatusMessage('SUCCEEDED');
-          await loadPipelineResults();
-        } else if (data.status === 'ABORTED') {
-          clearInterval(pollInterval);
-          setPipelineStatus('FAILED');
-          setStatusMessage('ABORTED');
-          // Don't set error for ABORTED status
-        } else if (data.status === 'FAILED') {
-          clearInterval(pollInterval);
-          setPipelineStatus('FAILED');
-          setStatusMessage('FAILED');
-          setError(`Pipeline execution ${data.status.toLowerCase()}`);
-        }
-        // Continue polling for other statuses
-      } catch (err) {
-        clearInterval(pollInterval);
-        setPipelineStatus('FAILED');
-        const errorMessage = err instanceof Error ? err.message : 'Failed to check pipeline status';
-        setError(errorMessage);
-        setStatusMessage('FAILED');
-      }
-    }, 10000); // Poll every 10 seconds
-
-    // Store interval ID to clear it if component unmounts or user stops
-    return pollInterval;
-  };
-
-  const loadPipelineResults = async () => {
-    try {
-      const response = await fetch('/api/products');
-      const results = await response.json();
-      setProducts(results);
-      setStatusMessage('Results loaded successfully');
-      setPipelineStatus('COMPLETED');
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to load results';
-      setError(errorMessage);
-      setStatusMessage(`Error loading results: ${errorMessage}`);
-      setPipelineStatus('FAILED');
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   // Handle Active Search toggle
   const handleActiveSearchToggle = (checked: boolean) => {
@@ -365,7 +299,8 @@ const Dashboard = () => {
   const getApiParams = useCallback(() => {
     return {
       // Basic filters
-      keyword: keywordSearch || undefined,
+      keyword: (searchingMode === 'MANUAL' || searchingMode === 'ATAI AUTO') ? (keywordSearch || undefined) : undefined,
+      category: (searchingMode === 'CATEGORY BASED' && productCategory !== 'All categories') ? productCategory : undefined,
       search_volume_min: kwpMonthlySearches || undefined,
       blacklist: blacklistedWords || undefined,
       location: getCountryCode(location) || undefined,
@@ -409,7 +344,7 @@ const Dashboard = () => {
     moq,
     alibabaRating,
     verifiedSupplier,
-    verifiedSupplier,
+    productCategory,
     getCountryCode,
     searchingMode
   ]);
@@ -467,8 +402,12 @@ const Dashboard = () => {
     }
 
     setIsLoading(true);
+    setProducts([]); // Clear old results immediately
     setError(null);
     setIsPreliminary(false);
+    setPipelineStatus('IDLE');
+    setExecutionArn(null);
+    setStatusMessage('');
 
     try {
       if (activeSearch && pipelineStatus !== 'COMPLETED') {
@@ -485,16 +424,17 @@ const Dashboard = () => {
         };
 
         const payload = {
-          keyword: keywordSearch,
+          keyword: (searchingMode === 'MANUAL' || searchingMode === 'ATAI AUTO') ? keywordSearch : "",
           search_mode: searchModeMap[searchingMode] || 'manual_search',
           filters: {
             location: getCountryCode(location),
-            category: productCategory,
+            category: searchingMode === 'CATEGORY BASED' ? productCategory : "",
             trendPeriod: parseInt(trendPeriod),
             variantLimitMax: parseInt(variantLimitMax),
             size: parseInt(resultsCap),
             amazonFilters: amazonFilters,
-            alibabaFilters: alibabaFilters
+            alibabaFilters: alibabaFilters,
+            blacklist: blacklistedWords
           }
         };
 
@@ -510,13 +450,16 @@ const Dashboard = () => {
         }
 
         const triggerData = await triggerResponse.json();
+
+        if (!triggerData.success) {
+          throw new Error(triggerData.message || 'No data found for this search');
+        }
+
         setExecutionArn(triggerData.executionArn);
         setPipelineStatus('POLLING');
         setStatusMessage('RUNNING');
 
-        // Step 2: Start status polling
-        startStatusPolling(triggerData.executionArn);
-
+        // Note: status polling is now handled by the Polling Effect below
       } else {
         // Either Active Search is OFF OR pipeline has completed - Call products API directly with filters
         const params = getApiParams();
@@ -599,7 +542,17 @@ const Dashboard = () => {
 
             // 2. Fetch Preliminary Data (Optional: Update products with preliminary data if desired)
             try {
-              const prelimRes = await fetch(`/api/pipeline/preliminary`);
+              const queryParams = new URLSearchParams();
+              const mode = searchModeMap[searchingMode] || 'manual_search';
+              queryParams.append('search_mode', mode);
+
+              if (mode === 'category_search') {
+                queryParams.append('category', productCategory);
+              } else if (keywordSearch) {
+                queryParams.append('keyword', keywordSearch);
+              }
+
+              const prelimRes = await fetch(`/api/pipeline/preliminary?${queryParams.toString()}`);
               const prelimData = await prelimRes.json();
               if (prelimData.results && prelimData.results.length > 0) {
                 // Show partial results
@@ -627,7 +580,7 @@ const Dashboard = () => {
         setPollingIntervalRef(null);
       }
     }
-  }, [pipelineStatus, executionArn, keywordSearch, getApiParams]);
+  }, [pipelineStatus, executionArn, keywordSearch, searchingMode, productCategory, getApiParams]);
 
 
   // Prevent hydration mismatch by only rendering on client
@@ -1391,7 +1344,7 @@ const Dashboard = () => {
                     <tbody>
                       {products.map((product, index) => (
                         <tr
-                          key={product.global_id || product.product_id || index}
+                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
                           className="group hover:bg-[#3d4d3a] transition-colors"
                         >
                           <td
@@ -1500,7 +1453,7 @@ const Dashboard = () => {
                     <tbody>
                       {products.map((product, index) => (
                         <tr
-                          key={product.global_id || product.product_id || index}
+                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
                           className="group hover:bg-[#3d4d3a] transition-colors"
                         >
                           <td
@@ -1601,7 +1554,7 @@ const Dashboard = () => {
                   <tbody>
                     {products.map((product, index) => (
                       <tr
-                        key={product.global_id || product.product_id || index}
+                        key={`${product.global_id || product.product_id || 'prod'}-${index}`}
                         className="group hover:bg-[#3d4d3a] transition-colors"
                       >
                         <td
@@ -1623,37 +1576,38 @@ const Dashboard = () => {
                           {product.title || '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.base_price_usd != null ? `${product.base_price_usd.toFixed(2)}` : '-'}
+                          {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
                           {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
                         </td>
+
                         <td className="border border-white px-3 py-2">
-                          {product.fcl_price_usd != null ? `${product.fcl_price_usd.toFixed(2)}` : '-'}
+                          {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.keyword_interest_score != null ? product.keyword_interest_score : '-'}
+                          {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.avg_monthly_searches != null ? product.avg_monthly_searches.toLocaleString() : '-'}
+                          {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.margin_pct != null ? `${product.margin_pct.toFixed(2)}%` : '-'}
+                          {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.trend_score != null ? Math.round(product.trend_score) : '-'}
+                          {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.supplier_score != null ? Math.round(product.supplier_score) : '-'}
+                          {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.price_comp_score != null ? Math.round(product.price_comp_score) : '-'}
+                          {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.final_score != null ? Math.round(product.final_score) : '-'}
+                          {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
                         </td>
                         <td className="border border-white px-3 py-2">
-                          {product.rank != null ? product.rank : '-'}
+                          {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
                         </td>
                       </tr>
                     ))}
@@ -1672,3 +1626,11 @@ const Dashboard = () => {
 };
 
 export default Dashboard;
+
+
+
+
+
+
+
+

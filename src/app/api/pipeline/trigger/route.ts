@@ -17,18 +17,18 @@ export async function POST(request: NextRequest) {
 
         console.log(`Triggering pipeline for ${keyword ? `keyword: ${keyword}` : `category: ${category}`} with filters:`, filters, `mode: ${search_mode}`);
         console.log(`Filters:`, filters);
-        const executionArn = await startPipelineExecution(keyword, filters, search_mode);
+        const result = await startPipelineExecution(keyword, filters, search_mode);
 
         return NextResponse.json({
-            success: true,
-            executionArn,
-            message: "Pipeline started successfully"
+            success: result.status !== 'FAILED',
+            executionArn: result.executionArn,
+            message: result.message
         });
 
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error("Pipeline Trigger Error:", error);
         return NextResponse.json(
-            { error: error.message || "Failed to start pipeline" },
+            { error: (error as Error).message || "Failed to start pipeline" },
             { status: 500 }
         );
     }

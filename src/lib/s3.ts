@@ -12,13 +12,17 @@ const s3Client = new S3Client({
 });
 
 export async function fetchProductsFromS3(search_mode: string = 'manual_search') {
-    const bucket = process.env.S3_RANKED_BUCKET || "atai-result-data";
+    const bucket = process.env.S3_RANKED_BUCKET;
+    if (!bucket) {
+        console.warn("S3_RANKED_BUCKET is not defined. Falling back to atai-clean-layer.");
+    }
+    const targetBucket = bucket || "atai-clean-layer";
 
     try {
         if (search_mode === 'category_search') {
-            const prefix = "ranked/category_search/";
+            const prefix = "consolidated/category_search/";
             const listCommand = new ListObjectsV2Command({
-                Bucket: bucket,
+                Bucket: targetBucket,
                 Prefix: prefix
             });
             const listResponse = await s3Client.send(listCommand);
@@ -35,7 +39,7 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search')
                 .filter(obj => obj.Key && obj.Key.endsWith('.parquet'))
                 .map(async (obj) => {
                     try {
-                        const command = new GetObjectCommand({ Bucket: bucket, Key: obj.Key });
+                        const command = new GetObjectCommand({ Bucket: targetBucket, Key: obj.Key });
                         const response = await s3Client.send(command);
                         const body = await response.Body?.transformToByteArray();
 
@@ -56,12 +60,13 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search')
         } else {
             // Default to manual search single file
             const key = process.env.S3_RANKED_KEY || "ranked/manual_search/ranked_results.parquet";
+            console.log(`Fetching products from S3 bucket: ${targetBucket}, key: ${key}`);
 
             try {
-                const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+                const command = new GetObjectCommand({ Bucket: targetBucket, Key: key });
                 const response = await s3Client.send(command);
                 const body = await response.Body?.transformToByteArray();
-
+                console.log("Fetched object from S3:", body ? body.length : "no body");
                 if (!body) return [];
 
                 const arrayBuffer = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
@@ -89,13 +94,13 @@ export async function fetchCriteriaFromS3() {
         const response = await s3Client.send(command);
         const bodyString = await response.Body?.transformToString();
         return bodyString ? jsonSafeParse(bodyString, []) : [];
-    } catch (error: any) {
-        if (error.name === "NoSuchKey") return [];
+    } catch (error: unknown) {
+        if ((error as { name?: string }).name === "NoSuchKey") return [];
         throw error;
     }
 }
 
-export async function saveCriteriaToS3(criteria: any[]) {
+export async function saveCriteriaToS3(criteria: unknown[]) {
     const bucket = process.env.S3_CONFIG_BUCKET || "atai-config";
     const key = process.env.S3_CRITERIA_KEY || "discovery_criteria.json";
 
@@ -109,7 +114,7 @@ export async function saveCriteriaToS3(criteria: any[]) {
     await s3Client.send(command);
 }
 
-function jsonSafeParse(str: string, fallback: any) {
+function jsonSafeParse<T>(str: string, fallback: T): T {
     try {
         return JSON.parse(str);
     } catch {

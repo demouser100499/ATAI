@@ -6,8 +6,10 @@ export async function GET(request: NextRequest) {
     try {
         const { searchParams } = new URL(request.url);
         const keyword = searchParams.get("keyword");
+        const searchMode = searchParams.get("search_mode") || "manual_search";
+        const category = searchParams.get("category");
 
-        const results = await getPreliminaryResults(keyword || undefined);
+        const results = await getPreliminaryResults(keyword || undefined, searchMode, category || undefined);
 
         // BigInt is not JSON serializable, convert to Number/String
         const serialized = JSON.parse(JSON.stringify(results, (key, value) =>
@@ -21,11 +23,12 @@ export async function GET(request: NextRequest) {
             isPreliminary: true
         });
 
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error("Preliminary Results Error:", error);
 
+        const s3Error = error as { name?: string; Code?: string; message?: string };
         // Return empty results instead of error if data not ready yet
-        if (error.name === 'NoSuchKey' || error.Code === 'NoSuchKey') {
+        if (s3Error.name === 'NoSuchKey' || s3Error.Code === 'NoSuchKey') {
             return NextResponse.json({
                 success: true,
                 count: 0,
@@ -36,7 +39,7 @@ export async function GET(request: NextRequest) {
         }
 
         return NextResponse.json(
-            { error: error.message || "Failed to fetch preliminary results" },
+            { error: s3Error.message || "Failed to fetch preliminary results" },
             { status: 500 }
         );
     }

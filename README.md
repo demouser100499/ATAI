@@ -4,7 +4,7 @@ This is a Next.js 15+ App Router project providing server-side APIs to interact 
 
 ## 🚀 Setup Instructions
 
-1.  **Extract the Files**: Once you extract the zip, open the folder in your IDE (VS Code recommended).
+1.**Extract the Files**: Once you extract the zip, open the folder in your IDE (VS Code recommended).
 2.  **Install Dependencies**:
     ```bash
     npm install

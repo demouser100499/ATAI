@@ -49,7 +49,10 @@ export async function GET(request: NextRequest) {
             // 1. Basic Filters
             const matchKeyword = !keyword || p.keyword?.toLowerCase().includes(keyword);
             const prodCategory = p.category_leaf || p.category;
-            const matchCategory = !category || prodCategory?.toLowerCase().includes(category);
+            const searchCategoryVal = p.search_category;
+            const matchCategory = !category ||
+                (typeof searchCategoryVal === 'string' && searchCategoryVal.toLowerCase().includes(category)) ||
+                prodCategory?.toLowerCase().includes(category);
             // const matchScore = Number(p.final_score || 0) >= minScore;
             // Legacy margin param support
             // const matchLegacyMargin = Number(p.margin_pct || 0) >= minMargin;
@@ -132,8 +135,8 @@ export async function GET(request: NextRequest) {
         ));
 
         return NextResponse.json(serialized);
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error("Products API Error:", error);
-        return NextResponse.json({ error: error.message }, { status: 500 });
+        return NextResponse.json({ error: (error as Error).message }, { status: 500 });
     }
 }
