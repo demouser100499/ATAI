@@ -66,6 +66,7 @@ const Dashboard = () => {
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [pollingIntervalRef, setPollingIntervalRef] = useState<NodeJS.Timeout | null>(null);
   const [isPreliminary, setIsPreliminary] = useState(false);
+  const [hasPerformedSearch, setHasPerformedSearch] = useState(false);
 
   // Check if fields should be disabled (after successful pipeline completion)
   // KEYWORD SEARCH and LOCATION should remain enabled
@@ -205,6 +206,7 @@ const Dashboard = () => {
     setExecutionArn(null);
     setStatusMessage('');
     setIsPreliminary(false);
+    setHasPerformedSearch(false);
 
     // Clear validation errors
     setKeywordSearchError('');
@@ -408,6 +410,7 @@ const Dashboard = () => {
     setPipelineStatus('IDLE');
     setExecutionArn(null);
     setStatusMessage('');
+    setHasPerformedSearch(true);
 
     try {
       if (activeSearch && pipelineStatus !== 'COMPLETED') {
@@ -552,7 +555,7 @@ const Dashboard = () => {
                 queryParams.append('keyword', keywordSearch);
               }
 
-              const prelimRes = await fetch(`/api/pipeline/preliminary?${queryParams.toString()}`);
+              const prelimRes = await fetch(`/api/pipeline/preliminary`);
               const prelimData = await prelimRes.json();
               if (prelimData.results && prelimData.results.length > 0) {
                 // Show partial results
@@ -724,15 +727,36 @@ const Dashboard = () => {
                     className="w-full px-3 py-2 text-black bg-white border border-gray-300 focus:outline-none focus:border-blue-500"
                   >
                     <option value="All categories">All categories</option>
-                    <option value="Electronics">Electronics</option>
-                    <option value="Home & Kitchen">Home & Kitchen</option>
-                    <option value="Fashion">Fashion</option>
+                    <option value="Electronics & Tech">Electronics & Tech</option>
+                    <option value="Computers & Accessories">Computers & Accessories</option>
+                    <option value="Mobile Accessories">Mobile Accessories</option>
+                    <option value="Home & Living">Home & Living</option>
+                    <option value="Furniture">Furniture</option>
+                    <option value="Kitchen & Dining">Kitchen & Dining</option>
+                    <option value="Home Appliances">Home Appliances</option>
+                    <option value="Electrical & Solar">Electrical & Solar</option>
+                    <option value="Fashion & Apparel">Fashion & Apparel</option>
+                    <option value="Footwear">Footwear</option>
+                    <option value="Bags & Luggage">Bags & Luggage</option>
                     <option value="Beauty & Personal Care">Beauty & Personal Care</option>
+                    <option value="Health & Medical">Health & Medical</option>
+                    <option value="Baby & Kids">Baby & Kids</option>
                     <option value="Toys & Games">Toys & Games</option>
-                    <option value="Sports & Outdoors">Sports & Outdoors</option>
-                    <option value="Health, Household & Baby">Health, Household & Baby</option>
-                    <option value="Automotive & Industrial">Automotive & Industrial</option>
-                    <option value="Books & Digital Media">Books & Digital Media</option>
+                    <option value="Sports & Fitness">Sports & Fitness</option>
+                    <option value="Automotive & Bike">Automotive & Bike</option>
+                    <option value="Pet Supplies">Pet Supplies</option>
+                    <option value="Office & School">Office & School</option>
+                    <option value="Books & Education">Books & Education</option>
+                    <option value="Hobbies & Craft">Hobbies & Craft</option>
+                    <option value="Gaming">Gaming</option>
+                    <option value="Garden & Outdoor">Garden & Outdoor</option>
+                    <option value="Cleaning & Household">Cleaning & Household</option>
+                    <option value="Packaging & Storage">Packaging & Storage</option>
+                    <option value="Industrial & B2B">Industrial & B2B</option>
+                    <option value="Construction & Building">Construction & Building</option>
+                    <option value="Food & Grocery">Food & Grocery</option>
+                    <option value="Jewelry & Watches">Jewelry & Watches</option>
+                    <option value="Travel & Accessories">Travel & Accessories</option>
                   </select>
                 </div>
               )}
@@ -1253,7 +1277,7 @@ const Dashboard = () => {
         </div>
 
         {/* Products Results Table */}
-        {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE') && (
+        {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE' || hasPerformedSearch) && (
           <div className="mt-8">
             {error && (
               <div className="flex items-center justify-center min-h-[200px]">
@@ -1298,13 +1322,16 @@ const Dashboard = () => {
 
             {products.length > 0 && pipelineStatus === 'COMPLETED' && (
               <>
-                <div className="text-center mb-6">
-                  <p className={`${isPreliminary ? 'text-yellow-500' : 'text-green-600'} text-4xl font-bold mb-2`}>
-                    {isPreliminary ? 'PRELIMINARY / PROCESSING' : 'SUCCEEDED'}
-                  </p>
-                  <p className="text-gray-600 text-lg">
-                    {isPreliminary ? 'Intermediate results found:' : `Found ${products.length} products`}
-                  </p>
+                <div className="flex justify-between items-center mb-4">
+                  <div className="text-xl font-bold text-white">
+                    Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                  </div>
+                  <div className="text-center">
+                    <p className={`${isPreliminary ? 'text-yellow-500' : 'text-green-600'} text-4xl font-bold mb-2`}>
+                      {isPreliminary ? 'PRELIMINARY / PROCESSING' : 'SUCCEEDED'}
+                    </p>
+                  </div>
+                  <div className="w-48"></div> {/* Spacer for symmetry */}
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
@@ -1330,6 +1357,7 @@ const Dashboard = () => {
                         </th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
@@ -1370,6 +1398,9 @@ const Dashboard = () => {
                           </td>
                           <td className="border border-white px-3 py-2">
                             {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
                           </td>
                           <td className="border border-white px-3 py-2">
                             {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
@@ -1402,18 +1433,20 @@ const Dashboard = () => {
                       ))}
                     </tbody>
                   </table>
-                  <div className="mt-2 text-sm text-gray-300">
-                    Showing {products.length} product{products.length !== 1 ? 's' : ''}
-                  </div>
                 </div>
               </>
             )}
 
             {products.length > 0 && pipelineStatus === 'POLLING' && isPreliminary && (
               <>
-                <div className="text-center mb-6">
-                  <p className="text-yellow-500 text-4xl font-bold mb-2">PRELIMINARY / PROCESSING</p>
-                  <p className="text-gray-600 text-lg">Intermediate results found: {products.length}</p>
+                <div className="flex justify-between items-center mb-4">
+                  <div className="text-xl font-bold text-white">
+                    Total Products: <span className="text-yellow-500">{products.length}</span>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-yellow-500 text-4xl font-bold mb-2">PRELIMINARY / PROCESSING</p>
+                  </div>
+                  <div className="w-48"></div> {/* Spacer for symmetry */}
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm opacity-70">
@@ -1439,6 +1472,7 @@ const Dashboard = () => {
                         </th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
@@ -1479,6 +1513,9 @@ const Dashboard = () => {
                           </td>
                           <td className="border border-white px-3 py-2">
                             {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
                           </td>
                           <td className="border border-white px-3 py-2">
                             {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
@@ -1516,105 +1553,127 @@ const Dashboard = () => {
             )}
 
             {products.length > 0 && pipelineStatus === 'IDLE' && (
-              <div className="overflow-x-auto">
-                <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
-                  <thead>
-                    <tr className="bg-yellow-500 text-black">
-                      <th
-                        className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
-                        style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                      >
-                        Global ID
-                      </th>
-                      <th
-                        className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                        style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                      >
-                        Keyword
-                      </th>
-                      <th
-                        className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                        style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                      >
-                        Title
-                      </th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {products.map((product, index) => (
-                      <tr
-                        key={`${product.global_id || product.product_id || 'prod'}-${index}`}
-                        className="group hover:bg-[#3d4d3a] transition-colors"
-                      >
-                        <td
-                          className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+              <div className="mt-8">
+                <div className="flex justify-between items-center mb-4 border-b border-white/20 pb-4">
+                  <h2 className="text-2xl font-bold tracking-wider">PRODUCT RESULTS</h2>
+                  <div className="text-xl font-bold text-white">
+                    Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
+                    <thead>
+                      <tr className="bg-yellow-500 text-black">
+                        <th
+                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
                           style={{ minWidth: '120px', borderRight: '2px solid white' }}
                         >
-                          {product.global_id || '-'}
-                        </td>
-                        <td
-                          className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                          Global ID
+                        </th>
+                        <th
+                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
                           style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
                         >
-                          {product.keyword ? toTitleCase(product.keyword) : '-'}
-                        </td>
-                        <td
-                          className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                          Keyword
+                        </th>
+                        <th
+                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
                           style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
                         >
-                          {product.title || '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
-                        </td>
-
-                        <td className="border border-white px-3 py-2">
-                          {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
-                        </td>
+                          Title
+                        </th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div className="mt-2 text-sm text-gray-300">
-                  Showing {products.length} product{products.length !== 1 ? 's' : ''}
+                    </thead>
+                    <tbody>
+                      {products.map((product, index) => (
+                        <tr
+                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
+                          className="group hover:bg-[#3d4d3a] transition-colors"
+                        >
+                          <td
+                            className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            style={{ minWidth: '120px', borderRight: '2px solid white' }}
+                          >
+                            {product.global_id || '-'}
+                          </td>
+                          <td
+                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                          >
+                            {product.keyword ? toTitleCase(product.keyword) : '-'}
+                          </td>
+                          <td
+                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                          >
+                            {product.title || '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {products.length === 0 && !isLoading && !error && hasPerformedSearch && (
+              <div className="flex flex-col items-center justify-center min-h-[300px] bg-[#32402F] rounded-lg border border-white/20">
+                <div className="text-center">
+                  <p className="text-[#C0FE72] text-4xl font-bold mb-4">NO RESULTS FOUND</p>
+                  <p className="text-gray-300 text-lg">We couldn't find any products matching your criteria.</p>
+                  <button
+                    onClick={handleReset}
+                    className="mt-6 px-6 py-2 bg-yellow-500 text-black font-bold rounded hover:bg-yellow-400 transition-colors"
+                  >
+                    CLEAR FILTERS
+                  </button>
                 </div>
               </div>
             )}
@@ -1626,11 +1685,6 @@ const Dashboard = () => {
 };
 
 export default Dashboard;
-
-
-
-
-
 
 
 

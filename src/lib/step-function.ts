@@ -34,7 +34,7 @@ let STATE_MACHINE_ARN = process.env.STEP_FUNCTION_ARN;
 if (STATE_MACHINE_ARN && STATE_MACHINE_ARN.endsWith(':')) {
     STATE_MACHINE_ARN = STATE_MACHINE_ARN.slice(0, -1);
 }
-const S3_CLEAN_BUCKET = process.env.S3_RANKED_BUCKET || process.env.S3_CLEAN_BUCKET || "atai-clean-layer";
+const S3_RANKED_BUCKET = process.env.S3_RANKED_BUCKET;
 let CRITERIA_EVALUATOR_FUNCTION = process.env.CRITERIA_EVALUATOR_FUNCTION || "atai-criteria-evaluator";
 
 // Sanitize Lambda function name/ARN (remove trailing colons which cause ValidationException)
@@ -203,7 +203,7 @@ export async function getPreliminaryResults(keyword?: string, search_mode: strin
         if (search_mode === 'category_search') {
             const prefix = "consolidated/category_search/";
             const listCommand = new ListObjectsV2Command({
-                Bucket: S3_CLEAN_BUCKET,
+                Bucket: S3_RANKED_BUCKET,
                 Prefix: prefix
             });
             const listResponse = await s3Client.send(listCommand);
@@ -219,7 +219,7 @@ export async function getPreliminaryResults(keyword?: string, search_mode: strin
                 .filter(obj => obj.Key && obj.Key.endsWith('.parquet'))
                 .map(async (obj) => {
                     try {
-                        const command = new GetObjectCommand({ Bucket: S3_CLEAN_BUCKET, Key: obj.Key });
+                        const command = new GetObjectCommand({ Bucket: S3_RANKED_BUCKET, Key: obj.Key });
                         const response = await s3Client.send(command);
                         const bodyValue = await response.Body?.transformToByteArray();
 
@@ -247,8 +247,8 @@ export async function getPreliminaryResults(keyword?: string, search_mode: strin
 
         // Default manual search flow
         const command = new GetObjectCommand({
-            Bucket: S3_CLEAN_BUCKET,
-            Key: "consolidated/consolidated_data.parquet"
+            Bucket: S3_RANKED_BUCKET,
+            Key: "consolidated/manual_search/consolidated_data.parquet"
         });
 
         const response = await s3Client.send(command);
