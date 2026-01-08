@@ -67,6 +67,7 @@ const Dashboard = () => {
   const [pollingIntervalRef, setPollingIntervalRef] = useState<NodeJS.Timeout | null>(null);
   const [isPreliminary, setIsPreliminary] = useState(false);
   const [hasPerformedSearch, setHasPerformedSearch] = useState(false);
+  const [categoryExecutions, setCategoryExecutions] = useState<{ keyword: string, run_id: string, execution_arn: string, status?: string }[]>([]);
 
   // Check if fields should be disabled (after successful pipeline completion)
   // KEYWORD SEARCH and LOCATION should remain enabled
@@ -131,6 +132,7 @@ const Dashboard = () => {
     setExecutionArn(null);
     setStatusMessage('');
     setIsPreliminary(false);
+    setCategoryExecutions([]);
 
     // Clear Validation Errors
     setKeywordSearchError('');
@@ -207,6 +209,7 @@ const Dashboard = () => {
     setStatusMessage('');
     setIsPreliminary(false);
     setHasPerformedSearch(false);
+    setCategoryExecutions([]);
 
     // Clear validation errors
     setKeywordSearchError('');
@@ -255,6 +258,8 @@ const Dashboard = () => {
     setExecutionArn(null);
     setStatusMessage('');
     setIsPreliminary(false);
+    setCategoryExecutions([]);
+    setHasPerformedSearch(false);
 
     // Clear validation errors
     setKeywordSearchError('');
@@ -453,9 +458,16 @@ const Dashboard = () => {
         }
 
         const triggerData = await triggerResponse.json();
+        console.log("\n 0000000000000000", triggerData)
 
         if (!triggerData.success) {
           throw new Error(triggerData.message || 'No data found for this search');
+        }
+
+        if (triggerData.execution_details) {
+          setCategoryExecutions(triggerData.execution_details.map((ex: any) => ({ ...ex, status: 'RUNNING' })));
+        } else {
+          setCategoryExecutions([]);
         }
 
         setExecutionArn(triggerData.executionArn);
@@ -502,48 +514,79 @@ const Dashboard = () => {
   // Polling Effect for Pipeline
   useEffect(() => {
     let pollingInterval: NodeJS.Timeout;
+    let childStatusCounter = 0;
 
     if (pipelineStatus === 'POLLING' && executionArn) {
       pollingInterval = setInterval(async () => {
         try {
-          // 1. Check Status
+          // 1. Check Status of Main (or Virtual) Execution
           const statusRes = await fetch(`/api/pipeline/status?arn=${executionArn}`);
           const statusData = await statusRes.json();
 
-          if (statusData.status === 'SUCCEEDED') {
+          let currentStatus = statusData.status;
+
+          // 2. Special handling for Category Based search: track individual keyword executions
+          if (searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0) {
+            childStatusCounter++;
+
+            // Poll children every ~10s (every 3rd main poll roughly)
+            if (childStatusCounter >= 3) {
+              childStatusCounter = 0;
+              const updatedExecutions = await Promise.all(categoryExecutions.map(async (exec) => {
+                if (exec.status === 'SUCCEEDED' || exec.status === 'FAILED' || exec.status === 'ABORTED' || exec.status === 'TIMED_OUT') return exec;
+                try {
+                  const res = await fetch(`/api/pipeline/status?arn=${exec.execution_arn}`);
+                  const data = await res.json();
+                  return { ...exec, status: data.status };
+                } catch (e) {
+                  console.error(`Error fetching status for child ${exec.keyword}:`, e);
+                  return exec;
+                }
+              }));
+
+              setCategoryExecutions(updatedExecutions);
+
+              // Check if all children are finished
+              const allFinished = updatedExecutions.every(e =>
+                e.status === 'SUCCEEDED' || e.status === 'FAILED' || e.status === 'ABORTED' || e.status === 'TIMED_OUT'
+              );
+
+              if (allFinished) {
+                currentStatus = 'SUCCEEDED';
+                console.log("All category keyword executions finished.");
+              }
+            }
+          }
+
+          if (currentStatus === 'SUCCEEDED') {
             setStatusMessage('Pipeline completed successfully! Fetching final results...');
             clearInterval(pollingInterval);
             setPollingIntervalRef(null);
             setPipelineStatus('COMPLETED');
             setIsPreliminary(false);
 
-            // Fetch final results (without filters or with filters as needed, plan said "without any filters" but typically we want the ranked data for this keyword)
-            // The user request said: "display the complete ranked_data without any filters"
-            // checking product api, it allows fetching all or by keyword. 
-            // We likely want to fetch by keyword to see the results of this run.
             const finalParams = getApiParams();
             const finalProducts = await fetchProducts(finalParams);
             setProducts(finalProducts);
             setIsLoading(false);
-          } else if (statusData.status === 'ABORTED') {
+          } else if (currentStatus === 'ABORTED') {
             setStatusMessage('ABORTED');
             setPipelineStatus('FAILED');
             setIsLoading(false);
             clearInterval(pollingInterval);
             setPollingIntervalRef(null);
-            // Don't set error for ABORTED status
-          } else if (statusData.status === 'FAILED' || statusData.status === 'TIMED_OUT') {
-            setStatusMessage(`Pipeline failed: ${statusData.status}`);
-            setError(`Pipeline execution failed: ${statusData.status}`);
+          } else if (currentStatus === 'FAILED' || currentStatus === 'TIMED_OUT') {
+            setStatusMessage(`Pipeline failed: ${currentStatus}`);
+            setError(`Pipeline execution failed: ${currentStatus}`);
             setPipelineStatus('FAILED');
             setIsLoading(false);
             clearInterval(pollingInterval);
             setPollingIntervalRef(null);
           } else {
             // Still running
-            setStatusMessage(statusData.status);
+            setStatusMessage(currentStatus);
 
-            // 2. Fetch Preliminary Data (Optional: Update products with preliminary data if desired)
+            // Fetch Preliminary Data
             try {
               const queryParams = new URLSearchParams();
               const mode = searchModeMap[searchingMode] || 'manual_search';
@@ -555,10 +598,9 @@ const Dashboard = () => {
                 queryParams.append('keyword', keywordSearch);
               }
 
-              const prelimRes = await fetch(`/api/pipeline/preliminary`);
+              const prelimRes = await fetch(`/api/pipeline/preliminary?${queryParams.toString()}`);
               const prelimData = await prelimRes.json();
               if (prelimData.results && prelimData.results.length > 0) {
-                // Show partial results
                 setProducts(prelimData.results);
                 setIsPreliminary(true);
               }
@@ -569,11 +611,9 @@ const Dashboard = () => {
 
         } catch (e) {
           console.error("Polling error", e);
-          // Don't stop polling on transient network errors, but maybe limit retries in a real app
         }
-      }, 3000); // Poll every 3 seconds
+      }, 3000);
 
-      // Store the interval reference
       setPollingIntervalRef(pollingInterval);
     }
 
@@ -583,7 +623,7 @@ const Dashboard = () => {
         setPollingIntervalRef(null);
       }
     }
-  }, [pipelineStatus, executionArn, keywordSearch, searchingMode, productCategory, getApiParams]);
+  }, [pipelineStatus, executionArn, keywordSearch, searchingMode, productCategory, categoryExecutions, getApiParams]);
 
 
   // Prevent hydration mismatch by only rendering on client
@@ -1279,6 +1319,49 @@ const Dashboard = () => {
         {/* Products Results Table */}
         {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE' || hasPerformedSearch) && (
           <div className="mt-8">
+            {/* Category Executions Details */}
+            {activeSearch && searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && (
+              <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">CATEGORY PIPELINE TRACKER</h3>
+                  <div className="text-xs text-gray-400">Updates every 10s</div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-white/30 text-gray-300">
+                        <th className="pb-3 pr-4 font-semibold uppercase tracking-wider">Target Keyword</th>
+                        <th className="pb-3 px-4 font-semibold uppercase tracking-wider">Execution Status</th>
+                        <th className="pb-3 pl-4 font-semibold uppercase tracking-wider">Run ID / ARN</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {categoryExecutions.map((exec, idx) => (
+                        <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                          <td className="py-4 pr-4 font-medium text-white">{exec.keyword}</td>
+                          <td className="py-4 px-4">
+                            <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold tracking-tight shadow-sm ${exec.status === 'SUCCEEDED' ? 'bg-green-500/20 text-green-400 border border-green-500/30' :
+                              exec.status === 'FAILED' ? 'bg-red-500/20 text-red-400 border border-red-500/30' :
+                                exec.status === 'RUNNING' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse' :
+                                  'bg-gray-500/20 text-gray-400 border border-gray-500/30'
+                              }`}>
+                              <span className={`w-2 h-2 rounded-full mr-2 ${exec.status === 'SUCCEEDED' ? 'bg-green-400' :
+                                exec.status === 'FAILED' ? 'bg-red-400' :
+                                  exec.status === 'RUNNING' ? 'bg-blue-400' :
+                                    'bg-gray-400'
+                                }`}></span>
+                              {exec.status || 'INITIALIZING'}
+                            </span>
+                          </td>
+                          <td className="py-4 pl-4 font-mono text-[10px] text-gray-500 break-all max-w-xs">{exec.run_id || exec.execution_arn}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             {error && (
               <div className="flex items-center justify-center min-h-[200px]">
                 <div className="text-center">

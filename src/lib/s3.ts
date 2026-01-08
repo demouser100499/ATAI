@@ -4,7 +4,7 @@ import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } fr
 import { parquetMetadata, parquetRead, parquetReadObjects } from "hyparquet";
 
 const s3Client = new S3Client({
-    region: process.env.AWS_REGION || "eu-north-1"
+    region: process.env.AWS_REGION || "eu-north-1",
     // credentials: {
     //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
     //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
@@ -20,7 +20,7 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search')
 
     try {
         if (search_mode === 'category_search') {
-            const prefix = "consolidated/category_search/";
+            const prefix = "ranked/category_search/";
             const listCommand = new ListObjectsV2Command({
                 Bucket: targetBucket,
                 Prefix: prefix

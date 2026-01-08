@@ -110,6 +110,7 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
             // Return a virtual execution ARN to track this category search
             return {
                 executionArn: `category_search:${category}:${Date.now()}`,
+                execution_details: responsePayload.status === 'SUCCESS' ? responsePayload.executions : [],
                 status: responsePayload.status === 'NO_KEYWORDS' ? 'FAILED' : 'SUCCEEDED',
                 message: responsePayload.status === 'NO_KEYWORDS' ? 'No keywords found for this category' : 'Pipeline started'
             };
@@ -158,13 +159,12 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
 
 export async function getExecutionStatus(executionArn: string) {
     if (executionArn.startsWith('category_search:')) {
-        // For category search, since it's a direct Lambda call, we don't have a real ARN
-        // We assume it's "succeeded" almost immediately or we just return a status
-        // In a real scenario, we might track the Lambda execution or check S3 for output
+        // For category search, we return RUNNING. The frontend will manage the completion
+        // based on the individual child executions.
         return {
-            status: 'SUCCEEDED',
+            status: 'RUNNING',
             startDate: new Date(),
-            stopDate: new Date()
+            stopDate: undefined
         };
     }
 
