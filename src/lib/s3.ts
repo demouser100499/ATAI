@@ -11,7 +11,7 @@ const s3Client = new S3Client({
     // },
 });
 
-export async function fetchProductsFromS3(search_mode: string = 'manual_search') {
+export async function fetchProductsFromS3(search_mode: string = 'manual_search', amazonFilters: boolean = true, alibabaFilters: boolean = true) {
     const bucket = process.env.S3_RANKED_BUCKET;
     if (!bucket) {
         console.warn("S3_RANKED_BUCKET is not defined. Falling back to atai-clean-layer.");
@@ -59,7 +59,14 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search')
             return allProducts;
         } else {
             // Default to manual search single file
-            const key = process.env.S3_RANKED_KEY || "ranked/manual_search/ranked_results.parquet";
+            // Case: Both Amazon and Alibaba filters disabled -> Use specific Key
+            let key = process.env.S3_RANKED_KEY || "ranked/manual_search/ranked_results.parquet";
+
+            if (!amazonFilters && !alibabaFilters) {
+                key = "ranked/manual_search/only_keyword/ranked_results.parquet";
+                console.log("Both Amazon and Alibaba filters disabled. Using key:", key);
+            }
+
             console.log(`Fetching products from S3 bucket: ${targetBucket}, key: ${key}`);
 
             try {
@@ -121,3 +128,6 @@ function jsonSafeParse<T>(str: string, fallback: T): T {
         return fallback;
     }
 }
+
+
+

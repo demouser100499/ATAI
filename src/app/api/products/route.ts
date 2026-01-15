@@ -6,8 +6,9 @@ export async function GET(request: NextRequest) {
         const { searchParams } = new URL(request.url);
 
         // 1. Basic Filters
-        const keyword = searchParams.get("keyword")?.toLowerCase();
-        const category = searchParams.get("category")?.toLowerCase();
+        const keyword = searchParams.get("keyword")?.toLowerCase().trim();
+        const category = searchParams.get("category")?.toLowerCase().trim();
+        console.log("Searching for category", category);
         // const minScore = parseFloat(searchParams.get("minScore") || "0");
         // const minMargin = parseFloat(searchParams.ge/t("minMargin") || "0"); // Keeps legacy support
 
@@ -41,8 +42,12 @@ export async function GET(request: NextRequest) {
         // 5. Search Mode
         const searchMode = searchParams.get("search_mode") || "manual_search";
 
-        const allProducts = await fetchProductsFromS3(searchMode);
-        console.log(`Successfully fetched products from S3 for mode ${searchMode}:`, allProducts.length);
+        // Determine if filters are ON or OFF
+        const amazonFiltersOn = searchParams.get("amazonFilters") !== "false";
+        const alibabaFiltersOn = searchParams.get("alibabaFilters") !== "false";
+
+        const allProducts = await fetchProductsFromS3(searchMode, amazonFiltersOn, alibabaFiltersOn);
+        console.log(`Successfully fetched products from S3 for mode ${searchMode} (Amz: ${amazonFiltersOn}, Ali: ${alibabaFiltersOn}):`, allProducts.length);
 
         // Backend Filtering
         const filteredProducts = allProducts.filter((p) => {
@@ -51,8 +56,8 @@ export async function GET(request: NextRequest) {
             const prodCategory = p.category_leaf || p.category;
             const searchCategoryVal = p.search_category;
             const matchCategory = !category ||
-                (typeof searchCategoryVal === 'string' && searchCategoryVal.toLowerCase().includes(category)) ||
-                prodCategory?.toLowerCase().includes(category);
+                (typeof searchCategoryVal === 'string' && searchCategoryVal.toLowerCase().includes(category))
+            // console.log("Match Category:", matchCategory);
             // const matchScore = Number(p.final_score || 0) >= minScore;
             // Legacy margin param support
             // const matchLegacyMargin = Number(p.margin_pct || 0) >= minMargin;
@@ -67,6 +72,7 @@ export async function GET(request: NextRequest) {
             // 2. Blacklist (Title or Keyword)
             const textToScan = ((p.title || "") + " " + (p.keyword || "")).toLowerCase();
             const isBlacklisted = blacklist.some(term => textToScan.includes(term));
+            // console.log("Blacklisted:", isBlacklisted);
             if (isBlacklisted) return false;
 
             // 3. Keyword Metrics
@@ -81,7 +87,7 @@ export async function GET(request: NextRequest) {
             let matchAmz = true;
             // Only apply Amazon sub-filters if the dashboard param is set (passed as 'on' or boolean)
             // dashboard.tsx passes amazonFilters: boolean
-            const amazonFiltersOn = searchParams.get("amazonFilters") !== "false";
+            // const amazonFiltersOn = searchParams.get("amazonFilters") !== "false"; // Already parsed above
 
             if (isAmazon && amazonFiltersOn) {
                 const price = Number(p.base_price_usd) || 0;
@@ -100,7 +106,7 @@ export async function GET(request: NextRequest) {
             }
 
             let matchAli = true;
-            const alibabaFiltersOn = searchParams.get("alibabaFilters") !== "false";
+            // const alibabaFiltersOn = searchParams.get("alibabaFilters") !== "false"; // Already parsed above
 
             if (isAlibaba && alibabaFiltersOn) {
                 const margin = Number(p.margin_pct) || 0;
@@ -123,7 +129,7 @@ export async function GET(request: NextRequest) {
             if (!amazonFiltersOn && isAmazon) return false;
             if (!alibabaFiltersOn && isAlibaba) return false;
 
-            return matchKeyword && matchCategory && matchVol && matchGT && matchAmz && matchAli && matchLocation;
+            return matchKeyword && matchCategory && matchVol && matchGT && matchAmz && matchAli && matchLocation && !isBlacklisted;
         });
 
         // Simple sorting by score descending if not already sorted
