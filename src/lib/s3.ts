@@ -20,7 +20,12 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search',
 
     try {
         if (search_mode === 'category_search') {
-            const prefix = "ranked/category_search/";
+            let prefix = "ranked/category_search/product_related/";
+
+            if (!amazonFilters && !alibabaFilters) {
+                prefix = "ranked/category_search/only_keyword/";
+                console.log("Both Amazon and Alibaba filters disabled. Using prefix:", prefix);
+            }
             const listCommand = new ListObjectsV2Command({
                 Bucket: targetBucket,
                 Prefix: prefix
