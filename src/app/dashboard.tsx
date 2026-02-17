@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import * as XLSX from 'xlsx';
 import { fetchProducts, Product } from '@/lib/productsService';
 
 // Countries with geo codes - moved outside component since it's static
@@ -66,11 +67,188 @@ const Dashboard = () => {
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [pollingIntervalRef, setPollingIntervalRef] = useState<NodeJS.Timeout | null>(null);
   const [isPreliminary, setIsPreliminary] = useState(false);
+  const [hasPerformedSearch, setHasPerformedSearch] = useState(false);
+  const [categoryExecutions, setCategoryExecutions] = useState<{ keyword: string, run_id: string, execution_arn: string, status?: string }[]>([]);
+  // Category test mode: keywords from Google Trends only (no pipeline trigger)
+  const [categoryKeywordsPreview, setCategoryKeywordsPreview] = useState<string[] | null>(null);
+  // Remember the core search context used for the last executed run.
+  // This lets us re-apply / refine filters against the same consolidated dataset
+  // without accidentally changing the root keyword/location until the user clicks SEARCH again.
+  const [lastSearchContext, setLastSearchContext] = useState<{
+    keyword?: string;
+    category?: string;
+    location?: string;
+    search_mode: string;
+  } | null>(null);
+
+  // Per-product expansion for nested stage specifications within the main table
+  const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
+
+  // For CATEGORY BASED mode: currently selected category variant keyword filter
+  const [selectedCategoryVariant, setSelectedCategoryVariant] = useState<string>('ALL');
+
+  // When in CATEGORY BASED mode and user selects a specific keyword, use that execution's ARN for stage data (Keyword Planner, Trends, Amazon, Alibaba)
+  const effectiveStageArn = useMemo(() => {
+    if (searchingMode === 'CATEGORY BASED' && selectedCategoryVariant && selectedCategoryVariant !== 'ALL') {
+      const selected = selectedCategoryVariant.trim();
+      const exec = categoryExecutions.find((e) => (e.keyword ?? '').trim() === selected);
+      return exec?.execution_arn ?? null;
+    }
+    return executionArn;
+  }, [searchingMode, selectedCategoryVariant, categoryExecutions, executionArn]);
+
+  // Keyword Planner stage data
+  const [keywordPlannerResults, setKeywordPlannerResults] = useState<any[] | null>(null);
+  const [keywordPlannerMeta, setKeywordPlannerMeta] = useState<{ message?: string; rows?: number } | null>(null);
+  const [hasLoadedKeywordPlanner, setHasLoadedKeywordPlanner] = useState(false);
+
+  // Google Trends stage data
+  const [trendsResults, setTrendsResults] = useState<any[] | null>(null);
+  const [trendsMeta, setTrendsMeta] = useState<{ message?: string; rows?: number } | null>(null);
+  const [hasLoadedTrends, setHasLoadedTrends] = useState(false);
+
+  // Marketplace stage data   
+  const [amazonResults, setAmazonResults] = useState<any[] | null>(null);
+  const [amazonMeta, setAmazonMeta] = useState<{ message?: string; rows?: number } | null>(null);
+  const [hasLoadedAmazon, setHasLoadedAmazon] = useState(false);
+  const [alibabaResults, setAlibabaResults] = useState<any[] | null>(null);
+  const [alibabaMeta, setAlibabaMeta] = useState<{ message?: string; rows?: number } | null>(null);
+  const [hasLoadedAlibaba, setHasLoadedAlibaba] = useState(false);
 
   // Check if fields should be disabled (after successful pipeline completion)
   // KEYWORD SEARCH and LOCATION should remain enabled
   const pipelineFieldsDisabled = pipelineStatus === 'COMPLETED'; // For VARIANT LIMIT MAX, RESULTS CAP MAX, TREND PERIOD
   const fieldsDisabled = false; // KEYWORD SEARCH and LOCATION are never disabled
+
+  // Helper: get value from row by exact key or by matching key (normalize: lowercase, underscores/spaces collapsed).
+  const getRowKeywordValue = (row: Record<string, unknown>, primaryKey: string): unknown => {
+    if (row[primaryKey] !== undefined && row[primaryKey] !== null) return row[primaryKey];
+    const normalizedPrimary = primaryKey.toLowerCase().replace(/[\s_]+/g, ' ');
+    for (const key of Object.keys(row)) {
+      const normalizedKey = key.toLowerCase().replace(/_/g, ' ');
+      if (normalizedKey === normalizedPrimary) return row[key];
+    }
+    return undefined;
+  };
+
+  // Helper: in category mode with a variant selected, filter stage rows to only those whose primary keyword matches the selected variant (normalized).
+  const filterStageRowsByVariant = useCallback(
+    (rows: any[] | null, fields: string[], primaryKeywordField?: string): any[] | null => {
+      if (!rows || rows.length === 0) return rows;
+      const variant = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant && selectedCategoryVariant !== 'ALL'
+        ? selectedCategoryVariant.trim().toLowerCase().replace(/\s+/g, ' ')
+        : null;
+      if (!variant) return rows;
+
+      const primary = primaryKeywordField ?? fields[0];
+      const normalize = (v: unknown) =>
+        (v != null ? String(v).trim().toLowerCase().replace(/\s+/g, ' ') : '');
+
+      return rows.filter((row) => {
+        const val = getRowKeywordValue(row as Record<string, unknown>, primary);
+        return normalize(val) === variant;
+      });
+    },
+    [searchingMode, selectedCategoryVariant]
+  );
+
+  // Export current pipeline execution's stage data (KWP, Trends, Amazon, Alibaba) as a single Excel file with one sheet per stage.
+  const handleExportCsv = useCallback(async () => {
+    if (pipelineStatus !== 'COMPLETED') return;
+
+    // Determine which execution ARN to export:
+    // - MANUAL / ATAI AUTO: use main executionArn
+    // - CATEGORY BASED: use the selected variant's execution_arn, or first child execution (never parent executionArn — stage data is per child)
+    let arnToUse: string | null = null;
+    if (searchingMode === 'CATEGORY BASED') {
+      const selectedExec =
+        selectedCategoryVariant && selectedCategoryVariant !== 'ALL'
+          ? categoryExecutions.find((e) => e.keyword === selectedCategoryVariant)
+          : categoryExecutions[0];
+      arnToUse = selectedExec?.execution_arn ?? null;
+    } else {
+      arnToUse = executionArn;
+    }
+
+    if (!arnToUse) {
+      console.warn('No execution ARN available for export.');
+      return;
+    }
+
+    try {
+      const wb = XLSX.utils.book_new();
+
+      const [kwpRes, trendsRes, amzRes, aliRes] = await Promise.all([
+        fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToUse)}`),
+        fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToUse)}`),
+        fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToUse)}`),
+        fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToUse)}`),
+      ]);
+
+      const parse = async (res: Response): Promise<any[] | null> => {
+        if (!res.ok) return null;
+        const data = await res.json() as { success?: boolean; available?: boolean; results?: any[] };
+        if (data.success && data.available && Array.isArray(data.results) && data.results.length > 0) {
+          return data.results;
+        }
+        return null;
+      };
+
+      const [kwpRows, trendsRows, amzRows, aliRows] = await Promise.all([
+        parse(kwpRes),
+        parse(trendsRes),
+        parse(amzRes),
+        parse(aliRes),
+      ]);
+
+      if (kwpRows?.length) {
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(kwpRows), 'Keyword Planner');
+      }
+      if (trendsRows?.length) {
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(trendsRows), 'Google Trends');
+      }
+      if (amzRows?.length) {
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(amzRows), 'Amazon');
+      }
+      if (aliRows?.length) {
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(aliRows), 'Alibaba');
+      }
+
+      const sheetCount = wb.SheetNames.length;
+      if (sheetCount === 0) {
+        console.warn('No stage data available to export for ARN', arnToUse);
+        return;
+      }
+
+      const now = new Date();
+      const datePart = `${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
+
+      let baseKeyword: string;
+      if (searchingMode === 'CATEGORY BASED') {
+        if (selectedCategoryVariant && selectedCategoryVariant !== 'ALL') {
+          baseKeyword = selectedCategoryVariant;
+        } else if (categoryExecutions[0]?.keyword) {
+          baseKeyword = categoryExecutions[0].keyword;
+        } else {
+          baseKeyword = 'category';
+        }
+      } else {
+        baseKeyword = keywordSearch || 'search';
+      }
+
+      const safeKeyword =
+        baseKeyword
+          .trim()
+          .replace(/[\\/:*?"<>|]+/g, '')
+          .replace(/\s+/g, '_') || 'search';
+
+      const fileName = `${safeKeyword}_${datePart}.xlsx`;
+
+      XLSX.writeFile(wb, fileName);
+    } catch (err) {
+      console.error('Error exporting Excel:', err);
+    }
+  }, [pipelineStatus, searchingMode, selectedCategoryVariant, categoryExecutions, executionArn, keywordSearch]);
 
   // Info button component with tooltip
   const InfoButton = ({ message }: { message: string }) => {
@@ -130,6 +308,19 @@ const Dashboard = () => {
     setExecutionArn(null);
     setStatusMessage('');
     setIsPreliminary(false);
+    setCategoryExecutions([]);
+    setKeywordPlannerResults(null);
+    setKeywordPlannerMeta(null);
+    setHasLoadedKeywordPlanner(false);
+    setTrendsResults(null);
+    setTrendsMeta(null);
+    setHasLoadedTrends(false);
+    setAmazonResults(null);
+    setAmazonMeta(null);
+    setHasLoadedAmazon(false);
+    setAlibabaResults(null);
+    setAlibabaMeta(null);
+    setHasLoadedAlibaba(false);
 
     // Clear Validation Errors
     setKeywordSearchError('');
@@ -205,6 +396,20 @@ const Dashboard = () => {
     setExecutionArn(null);
     setStatusMessage('');
     setIsPreliminary(false);
+    setHasPerformedSearch(false);
+    setCategoryExecutions([]);
+    setKeywordPlannerResults(null);
+    setKeywordPlannerMeta(null);
+    setHasLoadedKeywordPlanner(false);
+    setTrendsResults(null);
+    setTrendsMeta(null);
+    setHasLoadedTrends(false);
+    setAmazonResults(null);
+    setAmazonMeta(null);
+    setHasLoadedAmazon(false);
+    setAlibabaResults(null);
+    setAlibabaMeta(null);
+    setHasLoadedAlibaba(false);
 
     // Clear validation errors
     setKeywordSearchError('');
@@ -253,6 +458,20 @@ const Dashboard = () => {
     setExecutionArn(null);
     setStatusMessage('');
     setIsPreliminary(false);
+    setCategoryExecutions([]);
+    setHasPerformedSearch(false);
+    setKeywordPlannerResults(null);
+    setKeywordPlannerMeta(null);
+    setHasLoadedKeywordPlanner(false);
+    setTrendsResults(null);
+    setTrendsMeta(null);
+    setHasLoadedTrends(false);
+    setAmazonResults(null);
+    setAmazonMeta(null);
+    setHasLoadedAmazon(false);
+    setAlibabaResults(null);
+    setAlibabaMeta(null);
+    setHasLoadedAlibaba(false);
 
     // Clear validation errors
     setKeywordSearchError('');
@@ -297,14 +516,29 @@ const Dashboard = () => {
   };
 
   const getApiParams = useCallback(() => {
+    // Decide which keyword filter to send to the backend.
+    // - MANUAL / ATAI AUTO: use keywordSearch.
+    // - CATEGORY BASED: use selectedCategoryVariant when a specific variant is chosen.
+    let effectiveKeyword: string | undefined;
+    if (searchingMode === 'CATEGORY BASED') {
+      if (selectedCategoryVariant && selectedCategoryVariant !== 'ALL') {
+        effectiveKeyword = selectedCategoryVariant;
+      }
+    } else if (searchingMode === 'MANUAL' || searchingMode === 'ATAI AUTO') {
+      effectiveKeyword = keywordSearch || undefined;
+    }
+
+    // Category runs use manual_search Step Function executions, so ranked output lives under manual_search S3 path; fetch with manual_search so we read that data
+    const productsSearchMode = searchingMode === 'CATEGORY BASED' ? 'manual_search' : (searchModeMap[searchingMode] || 'manual_search');
+
     return {
       // Basic filters
-      keyword: (searchingMode === 'MANUAL' || searchingMode === 'ATAI AUTO') ? (keywordSearch || undefined) : undefined,
+      keyword: effectiveKeyword,
       category: (searchingMode === 'CATEGORY BASED' && productCategory !== 'All categories') ? productCategory : undefined,
       search_volume_min: kwpMonthlySearches || undefined,
       blacklist: blacklistedWords || undefined,
       location: getCountryCode(location) || undefined,
-      search_mode: searchModeMap[searchingMode] || 'manual_search',
+      search_mode: productsSearchMode,
       // Google Trend Score filter (when greater than 0)
       ...(googleTrendScore > 0 && { google_trend_score: googleTrendScore }),
 
@@ -328,6 +562,7 @@ const Dashboard = () => {
     };
   }, [
     keywordSearch,
+    selectedCategoryVariant,
     kwpMonthlySearches,
     blacklistedWords,
     location,
@@ -408,33 +643,74 @@ const Dashboard = () => {
     setPipelineStatus('IDLE');
     setExecutionArn(null);
     setStatusMessage('');
+    setHasPerformedSearch(true);
+    setSelectedCategoryVariant('ALL');
+    setCategoryKeywordsPreview(null);
+    setKeywordPlannerResults(null);
+    setKeywordPlannerMeta(null);
+    setHasLoadedKeywordPlanner(false);
+    setTrendsResults(null);
+    setTrendsMeta(null);
+    setHasLoadedTrends(false);
+    setAmazonResults(null);
+    setAmazonMeta(null);
+    setHasLoadedAmazon(false);
+    setAlibabaResults(null);
+    setAlibabaMeta(null);
+    setHasLoadedAlibaba(false);
 
     try {
-      if (activeSearch && pipelineStatus !== 'COMPLETED') {
-        // Active Search is ON and pipeline hasn't completed yet - Use pipeline workflow
+      // Capture the core search context used for this run.
+      // This is the "base dataset" that subsequent filter tweaks will refine.
+      const searchModeKey = searchModeMap[searchingMode] || 'manual_search';
+      const searchKeyword =
+        (searchingMode === 'MANUAL' || searchingMode === 'ATAI AUTO') ? (keywordSearch || undefined) : undefined;
+      const searchCategory =
+        (searchingMode === 'CATEGORY BASED' && productCategory !== 'All categories')
+          ? productCategory
+          : undefined;
+      const searchLocation = getCountryCode(location) || undefined;
+
+      const newSearchContext = {
+        keyword: searchKeyword,
+        category: searchCategory,
+        location: searchLocation,
+        search_mode: searchModeKey,
+      };
+      setLastSearchContext(newSearchContext);
+
+      if (activeSearch) {
+        // Active Search is ON: trigger pipeline (for MANUAL/ATAI AUTO one run; for CATEGORY BASED, backend generates keywords from Google Trends and starts one run per keyword)
 
         // Step 1: Trigger Pipeline
         setPipelineStatus('STARTING');
         setStatusMessage('STARTING');
 
-        const searchModeMap: Record<string, string> = {
-          'MANUAL': 'manual_search',
-          'CATEGORY BASED': 'category_search',
-          'ATAI AUTO': 'auto_search'
-        };
-
         const payload = {
-          keyword: (searchingMode === 'MANUAL' || searchingMode === 'ATAI AUTO') ? keywordSearch : "",
-          search_mode: searchModeMap[searchingMode] || 'manual_search',
+          keyword: searchKeyword || "",
+          search_mode: searchModeKey,
           filters: {
-            location: getCountryCode(location),
-            category: searchingMode === 'CATEGORY BASED' ? productCategory : "",
-            trendPeriod: parseInt(trendPeriod),
-            variantLimitMax: parseInt(variantLimitMax),
-            size: parseInt(resultsCap),
-            amazonFilters: amazonFilters,
-            alibabaFilters: alibabaFilters,
-            blacklist: blacklistedWords
+            location: searchLocation,
+            category: searchCategory || "",
+            trendPeriod: trendPeriod ? parseInt(trendPeriod) : undefined,
+            variantLimitMax: variantLimitMax ? parseInt(variantLimitMax) : undefined,
+            size: resultsCap ? parseInt(resultsCap) : undefined,
+            amazonFilters,
+            alibabaFilters,
+            blacklist: blacklistedWords || undefined,
+            fcl_percentage: fcl,
+            search_volume_min: kwpMonthlySearches ? parseInt(kwpMonthlySearches) : undefined,
+            google_trend_score: googleTrendScore > 0 ? googleTrendScore : undefined,
+            amz_price_min: amazonFilters && priceMin > 0 ? priceMin : undefined,
+            amz_price_max: amazonFilters && priceMax < 100 ? priceMax : undefined,
+            reviews_min: amazonFilters && reviewsMin > 0 ? reviewsMin : undefined,
+            reviews_max: amazonFilters && reviewsMax < 100 ? reviewsMax : undefined,
+            rating_min: amazonFilters && ratingFilter > 0 ? ratingFilter : undefined,
+            fcl_min: amazonFilters && fcl > 0 ? fcl : undefined,
+            margin_min: alibabaFilters && costBelow > 0 ? costBelow : undefined,
+            moq_max: alibabaFilters && moq ? parseInt(moq) : undefined,
+            supplier_rating_min: alibabaFilters && alibabaRating > 0 ? alibabaRating : undefined,
+            verified_supplier: alibabaFilters ? verifiedSupplier : undefined,
           }
         };
 
@@ -450,9 +726,19 @@ const Dashboard = () => {
         }
 
         const triggerData = await triggerResponse.json();
+        console.log("\n 0000000000000000", triggerData);
 
         if (!triggerData.success) {
           throw new Error(triggerData.message || 'No data found for this search');
+        }
+
+        if (triggerData.execution_details) {
+          setCategoryExecutions(triggerData.execution_details.map((ex: any) => ({ ...ex, status: 'RUNNING' })));
+          // Show which keywords were generated from Google Trends for this category run
+          setCategoryKeywordsPreview(triggerData.execution_details.map((ex: { keyword?: string }) => ex.keyword).filter(Boolean));
+        } else {
+          setCategoryExecutions([]);
+          setCategoryKeywordsPreview(searchingMode === 'CATEGORY BASED' ? [] : null);
         }
 
         setExecutionArn(triggerData.executionArn);
@@ -461,7 +747,8 @@ const Dashboard = () => {
 
         // Note: status polling is now handled by the Polling Effect below
       } else {
-        // Either Active Search is OFF OR pipeline has completed - Call products API directly with filters
+        // Active Search is OFF - just refine / fetch products from the latest consolidated dataset
+        // using the current filters, without re-running the pipeline.
         const params = getApiParams();
         const results = await fetchProducts(params);
         setProducts(results);
@@ -491,86 +778,368 @@ const Dashboard = () => {
     getApiParams,
     getCountryCode,
     amazonFilters,
-    alibabaFilters
+    alibabaFilters,
+    searchingMode,
+    productCategory,
+    blacklistedWords,
+    fcl,
+    kwpMonthlySearches,
+    googleTrendScore,
+    priceMin,
+    priceMax,
+    reviewsMin,
+    reviewsMax,
+    ratingFilter,
+    costBelow,
+    moq,
+    alibabaRating,
+    verifiedSupplier,
+    searchModeMap,
+  ]);
+
+  // Automatically refine the currently loaded consolidated dataset when
+  // the user adjusts filter thresholds, WITHOUT re-running the pipeline.
+  useEffect(() => {
+    if (!lastSearchContext) return;
+    if (!hasPerformedSearch) return;
+
+    // If Active Search is ON and the pipeline is still running,
+    // wait until it completes before auto-refining.
+    if (activeSearch && pipelineStatus !== 'COMPLETED') return;
+
+    const refine = async () => {
+      try {
+        // Category runs write to manual_search S3 path; fetch with manual_search so we read that data
+        const productsSearchMode = lastSearchContext.search_mode === 'category_search' ? 'manual_search' : lastSearchContext.search_mode;
+        const params: Record<string, any> = {
+          keyword: lastSearchContext.keyword,
+          category: lastSearchContext.category,
+          location: lastSearchContext.location,
+          search_mode: productsSearchMode,
+          search_volume_min: kwpMonthlySearches || undefined,
+          blacklist: blacklistedWords || undefined,
+          ...(googleTrendScore > 0 && { google_trend_score: googleTrendScore }),
+          amazonFilters,
+          alibabaFilters,
+          ...(amazonFilters && priceMin > 0 && { amz_price_min: priceMin }),
+          ...(amazonFilters && priceMax < 100 && { amz_price_max: priceMax }),
+          ...(amazonFilters && reviewsMin > 0 && { reviews_min: reviewsMin }),
+          ...(amazonFilters && reviewsMax < 100 && { reviews_max: reviewsMax }),
+          ...(amazonFilters && ratingFilter > 0 && { rating_min: ratingFilter }),
+          ...(amazonFilters && fcl > 0 && { fcl_min: fcl }),
+          ...(alibabaFilters && costBelow > 0 && { margin_min: costBelow }),
+          ...(alibabaFilters && moq && { moq_max: parseInt(moq) }),
+          ...(alibabaFilters && alibabaRating > 0 && { supplier_rating_min: alibabaRating }),
+          ...(alibabaFilters && verifiedSupplier && { verified_supplier: "true" }),
+        };
+
+        const results = await fetchProducts(params);
+        setProducts(results);
+      } catch (err) {
+        console.error('Error refining products with updated filters', err);
+      }
+    };
+
+    refine();
+  }, [
+    lastSearchContext,
+    hasPerformedSearch,
+    activeSearch,
+    pipelineStatus,
+    kwpMonthlySearches,
+    blacklistedWords,
+    googleTrendScore,
+    amazonFilters,
+    alibabaFilters,
+    priceMin,
+    priceMax,
+    reviewsMin,
+    reviewsMax,
+    ratingFilter,
+    fcl,
+    costBelow,
+    moq,
+    alibabaRating,
+    verifiedSupplier,
   ]);
 
 
 
+  // When user changes the category variant dropdown, clear stage data so we refetch for the selected keyword
+  const handleCategoryVariantChange = useCallback((newValue: string) => {
+    setSelectedCategoryVariant(newValue);
+    setKeywordPlannerResults(null);
+    setKeywordPlannerMeta(null);
+    setTrendsResults(null);
+    setTrendsMeta(null);
+    setAmazonResults(null);
+    setAmazonMeta(null);
+    setAlibabaResults(null);
+    setAlibabaMeta(null);
+    setHasLoadedKeywordPlanner(false);
+    setHasLoadedTrends(false);
+    setHasLoadedAmazon(false);
+    setHasLoadedAlibaba(false);
+  }, []);
+
+  // In category mode, when pipeline is completed and user selects a variant, fetch that keyword's stage data (same as manual mode)
+  useEffect(() => {
+    if (searchingMode !== 'CATEGORY BASED' || pipelineStatus !== 'COMPLETED') return;
+
+    const selected = selectedCategoryVariant?.trim();
+    if (!selected || selected === 'ALL') return;
+
+    const exec = categoryExecutions.find((e) => (e.keyword ?? '').trim() === selected);
+    const arnToFetch = exec?.execution_arn ?? null;
+    if (!arnToFetch) return;
+
+    let cancelled = false;
+    const fetchStagesForVariant = async () => {
+      try {
+        const [kwpRes, trendsRes, amzRes, aliRes] = await Promise.all([
+          fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToFetch)}`),
+          fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToFetch)}`),
+          amazonFilters ? fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToFetch)}`) : Promise.resolve(null),
+          alibabaFilters ? fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToFetch)}`) : Promise.resolve(null),
+        ]);
+
+        if (cancelled) return;
+
+        if (kwpRes?.ok) {
+          const kwpData = await kwpRes.json();
+          if (!cancelled && kwpData.success && kwpData.available && kwpData.results?.length > 0) {
+            setKeywordPlannerResults(kwpData.results);
+            setKeywordPlannerMeta(kwpData.meta || null);
+            setHasLoadedKeywordPlanner(true);
+          }
+        }
+        if (trendsRes?.ok) {
+          const trendsData = await trendsRes.json();
+          if (!cancelled && trendsData.success && trendsData.available && trendsData.results?.length > 0) {
+            setTrendsResults(trendsData.results);
+            setTrendsMeta(trendsData.meta || null);
+            setHasLoadedTrends(true);
+          }
+        }
+        if (amzRes?.ok) {
+          const amzData = await amzRes.json();
+          if (!cancelled && amzData.success && amzData.available && amzData.results?.length > 0) {
+            setAmazonResults(amzData.results);
+            setAmazonMeta(amzData.meta || null);
+            setHasLoadedAmazon(true);
+          }
+        }
+        if (aliRes?.ok) {
+          const aliData = await aliRes.json();
+          if (!cancelled && aliData.success && aliData.available && aliData.results?.length > 0) {
+            setAlibabaResults(aliData.results);
+            setAlibabaMeta(aliData.meta || null);
+            setHasLoadedAlibaba(true);
+          }
+        }
+      } catch (e) {
+        if (!cancelled) console.error("Error fetching stage data for category variant:", e);
+      }
+    };
+    fetchStagesForVariant();
+    return () => { cancelled = true; };
+  }, [searchingMode, pipelineStatus, selectedCategoryVariant, categoryExecutions, amazonFilters, alibabaFilters]);
+
   // Polling Effect for Pipeline
   useEffect(() => {
     let pollingInterval: NodeJS.Timeout;
+    let childStatusCounter = 0;
 
     if (pipelineStatus === 'POLLING' && executionArn) {
+      let categoryFirstArnWhenFinished: string | null = null;
+
       pollingInterval = setInterval(async () => {
         try {
-          // 1. Check Status
+          // 1. Check Status of Main (or Virtual) Execution
           const statusRes = await fetch(`/api/pipeline/status?arn=${executionArn}`);
           const statusData = await statusRes.json();
 
-          if (statusData.status === 'SUCCEEDED') {
-            setStatusMessage('Pipeline completed successfully! Fetching final results...');
+          let currentStatus = statusData.status;
+
+          // 2. Special handling for Category Based search: track individual keyword executions
+          if (searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0) {
+            childStatusCounter++;
+
+            // Poll children every ~10s (every 3rd main poll roughly)
+            if (childStatusCounter >= 3) {
+              childStatusCounter = 0;
+              const updatedExecutions = await Promise.all(categoryExecutions.map(async (exec) => {
+                if (exec.status === 'SUCCEEDED' || exec.status === 'FAILED' || exec.status === 'ABORTED' || exec.status === 'TIMED_OUT') return exec;
+                try {
+                  const res = await fetch(`/api/pipeline/status?arn=${exec.execution_arn}`);
+                  const data = await res.json();
+                  return { ...exec, status: data.status };
+                } catch (e) {
+                  console.error(`Error fetching status for child ${exec.keyword}:`, e);
+                  return exec;
+                }
+              }));
+
+              setCategoryExecutions(updatedExecutions);
+
+              // Check if all children are finished
+              const allFinished = updatedExecutions.every(e =>
+                e.status === 'SUCCEEDED' || e.status === 'FAILED' || e.status === 'ABORTED' || e.status === 'TIMED_OUT'
+              );
+
+              if (allFinished) {
+                currentStatus = 'SUCCEEDED';
+                const firstExec = updatedExecutions[0];
+                categoryFirstArnWhenFinished = firstExec?.execution_arn ?? null;
+                const firstKeyword = firstExec?.keyword;
+                if (firstKeyword) setSelectedCategoryVariant(firstKeyword);
+                console.log("All category keyword executions finished.");
+              }
+            }
+          }
+
+          const fetchMarketplaceStages = async (arnOverride?: string | null) => {
+            // In category mode use explicit ARN when provided (e.g. first execution when we just finished), else effectiveStageArn
+            const arnToUse = arnOverride !== undefined ? arnOverride : effectiveStageArn;
+            if (!arnToUse) return;
+
+            // Fetch Keyword Planner stage results once available
+            if (!hasLoadedKeywordPlanner) {
+              try {
+                const kwpRes = await fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToUse)}`);
+                if (kwpRes.ok) {
+                  const kwpData = await kwpRes.json();
+                  if (kwpData.success && kwpData.available && kwpData.results && kwpData.results.length > 0) {
+                    setKeywordPlannerResults(kwpData.results);
+                    setKeywordPlannerMeta(kwpData.meta || null);
+                    setHasLoadedKeywordPlanner(true);
+                  }
+                }
+              } catch (e) {
+                console.log("Error fetching Keyword Planner stage results", e);
+              }
+            }
+
+            // Fetch Google Trends stage results once available
+            if (!hasLoadedTrends) {
+              try {
+                const trendsRes = await fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToUse)}`);
+                if (trendsRes.ok) {
+                  const trendsData = await trendsRes.json();
+                  if (trendsData.success && trendsData.available && trendsData.results && trendsData.results.length > 0) {
+                    setTrendsResults(trendsData.results);
+                    setTrendsMeta(trendsData.meta || null);
+                    setHasLoadedTrends(true);
+                  }
+                }
+              } catch (e) {
+                console.log("Error fetching Google Trends stage results", e);
+              }
+            }
+
+            // Fetch Amazon marketplace stage results if enabled
+            if (amazonFilters && !hasLoadedAmazon) {
+              try {
+                const amzRes = await fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToUse)}`);
+                if (amzRes.ok) {
+                  const amzData = await amzRes.json();
+                  console.log("Amazon marketplace stage response:", amzData);
+                  if (amzData.success && amzData.available && amzData.results && amzData.results.length > 0) {
+                    setAmazonResults(amzData.results);
+                    setAmazonMeta(amzData.meta || null);
+                    setHasLoadedAmazon(true);
+                  }
+                }
+              } catch (e) {
+                console.log("Error fetching Amazon marketplace stage results", e);
+              }
+            }
+
+            // Fetch Alibaba marketplace stage results if enabled
+            if (alibabaFilters && !hasLoadedAlibaba) {
+              try {
+                const aliRes = await fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToUse)}`);
+                if (aliRes.ok) {
+                  const aliData = await aliRes.json();
+                  console.log("Alibaba marketplace stage response:", aliData);
+                  if (aliData.success && aliData.available && aliData.results && aliData.results.length > 0) {
+                    setAlibabaResults(aliData.results);
+                    setAlibabaMeta(aliData.meta || null);
+                    setHasLoadedAlibaba(true);
+                  }
+                }
+              } catch (e) {
+                console.log("Error fetching Alibaba marketplace stage results", e);
+              }
+            }
+          };
+
+          if (currentStatus === 'SUCCEEDED') {
+            // On success, ensure we fetch the latest stage data once more. In category mode use first execution ARN so we load the correct variant (effectiveStageArn not yet updated).
+            const arnForFetch = searchingMode === 'CATEGORY BASED' ? (categoryFirstArnWhenFinished ?? undefined) : undefined;
+            await fetchMarketplaceStages(arnForFetch);
+
+            setStatusMessage(searchingMode === 'CATEGORY BASED' ? 'Pipeline completed! View stage data below.' : 'Pipeline completed successfully! Fetching final results...');
             clearInterval(pollingInterval);
             setPollingIntervalRef(null);
             setPipelineStatus('COMPLETED');
             setIsPreliminary(false);
 
-            // Fetch final results (without filters or with filters as needed, plan said "without any filters" but typically we want the ranked data for this keyword)
-            // The user request said: "display the complete ranked_data without any filters"
-            // checking product api, it allows fetching all or by keyword. 
-            // We likely want to fetch by keyword to see the results of this run.
-            const finalParams = getApiParams();
-            const finalProducts = await fetchProducts(finalParams);
-            setProducts(finalProducts);
+            // Category mode: do not fetch/show ranked data; show only Keyword Planner, Google Trends, Amazon, Alibaba stage data (same as manual mode)
+            if (searchingMode !== 'CATEGORY BASED') {
+              const finalParams = getApiParams();
+              const finalProducts = await fetchProducts(finalParams);
+              setProducts(finalProducts);
+            }
             setIsLoading(false);
-          } else if (statusData.status === 'ABORTED') {
+          } else if (currentStatus === 'ABORTED') {
             setStatusMessage('ABORTED');
             setPipelineStatus('FAILED');
             setIsLoading(false);
             clearInterval(pollingInterval);
             setPollingIntervalRef(null);
-            // Don't set error for ABORTED status
-          } else if (statusData.status === 'FAILED' || statusData.status === 'TIMED_OUT') {
-            setStatusMessage(`Pipeline failed: ${statusData.status}`);
-            setError(`Pipeline execution failed: ${statusData.status}`);
+          } else if (currentStatus === 'FAILED' || currentStatus === 'TIMED_OUT') {
+            setStatusMessage(`Pipeline failed: ${currentStatus}`);
+            setError(`Pipeline execution failed: ${currentStatus}`);
             setPipelineStatus('FAILED');
             setIsLoading(false);
             clearInterval(pollingInterval);
             setPollingIntervalRef(null);
           } else {
             // Still running
-            setStatusMessage(statusData.status);
+            setStatusMessage(currentStatus);
 
-            // 2. Fetch Preliminary Data (Optional: Update products with preliminary data if desired)
-            try {
-              const queryParams = new URLSearchParams();
-              const mode = searchModeMap[searchingMode] || 'manual_search';
-              queryParams.append('search_mode', mode);
+            // While running, keep refreshing intermediate stage data
+            await fetchMarketplaceStages();
 
-              if (mode === 'category_search') {
-                queryParams.append('category', productCategory);
-              } else if (keywordSearch) {
-                queryParams.append('keyword', keywordSearch);
-              }
-
-              const prelimRes = await fetch(`/api/pipeline/preliminary?${queryParams.toString()}`);
-              const prelimData = await prelimRes.json();
-              if (prelimData.results && prelimData.results.length > 0) {
-                // Show partial results
-                setProducts(prelimData.results);
-                setIsPreliminary(true);
-              }
-            } catch (e) {
-              console.log("Error fetching preliminary data", e);
-            }
+            // Preliminary consolidated data fetching disabled for now while debugging marketplace stages
+            // try {
+            //   const queryParams = new URLSearchParams();
+            //   const mode = searchModeMap[searchingMode] || 'manual_search';
+            //   queryParams.append('search_mode', mode);
+            //
+            //   if (mode === 'category_search') {
+            //     queryParams.append('category', productCategory);
+            //   } else if (keywordSearch) {
+            //     queryParams.append('keyword', keywordSearch);
+            //   }
+            //
+            //   const prelimRes = await fetch(`/api/pipeline/preliminary?${queryParams.toString()}`);
+            //   const prelimData = await prelimRes.json();
+            //   if (prelimData.results && prelimData.results.length > 0) {
+            //     setProducts(prelimData.results);
+            //     setIsPreliminary(true);
+            //   }
+            // } catch (e) {
+            //   console.log("Error fetching preliminary data", e);
+            // }
           }
 
         } catch (e) {
           console.error("Polling error", e);
-          // Don't stop polling on transient network errors, but maybe limit retries in a real app
         }
-      }, 3000); // Poll every 3 seconds
+      }, 3000);
 
-      // Store the interval reference
       setPollingIntervalRef(pollingInterval);
     }
 
@@ -580,7 +1149,7 @@ const Dashboard = () => {
         setPollingIntervalRef(null);
       }
     }
-  }, [pipelineStatus, executionArn, keywordSearch, searchingMode, productCategory, getApiParams]);
+  }, [pipelineStatus, executionArn, effectiveStageArn, keywordSearch, searchingMode, productCategory, categoryExecutions, getApiParams, hasLoadedKeywordPlanner, hasLoadedTrends, amazonFilters, hasLoadedAmazon, alibabaFilters, hasLoadedAlibaba]);
 
 
   // Prevent hydration mismatch by only rendering on client
@@ -724,15 +1293,29 @@ const Dashboard = () => {
                     className="w-full px-3 py-2 text-black bg-white border border-gray-300 focus:outline-none focus:border-blue-500"
                   >
                     <option value="All categories">All categories</option>
-                    <option value="Electronics">Electronics</option>
-                    <option value="Home & Kitchen">Home & Kitchen</option>
-                    <option value="Fashion">Fashion</option>
-                    <option value="Beauty & Personal Care">Beauty & Personal Care</option>
-                    <option value="Toys & Games">Toys & Games</option>
-                    <option value="Sports & Outdoors">Sports & Outdoors</option>
-                    <option value="Health, Household & Baby">Health, Household & Baby</option>
-                    <option value="Automotive & Industrial">Automotive & Industrial</option>
-                    <option value="Books & Digital Media">Books & Digital Media</option>
+                    <option value="Arts & Entertainment">Arts & Entertainment</option>
+                    <option value="Autos & Vehicles">Autos & Vehicles</option>
+                    <option value="Beauty & Fitness">Beauty & Fitness</option>
+                    <option value="Books & Literature">Books & Literature</option>
+                    <option value="Business & Industrial">Business & Industrial</option>
+                    <option value="Computers & Electronics">Computers & Electronics</option>
+                    <option value="Finance">Finance</option>
+                    <option value="Food & Drink">Food & Drink</option>
+                    <option value="Games">Games</option>
+                    <option value="Health">Health</option>
+                    <option value="Hobbies & Leisure">Hobbies & Leisure</option>
+                    <option value="Home & Garden">Home & Garden</option>
+                    <option value="Internet & Telecom">Internet & Telecom</option>
+                    <option value="Jobs & Education">Jobs & Education</option>
+                    <option value="Law & Government">Law & Government</option>
+                    <option value="News">News</option>
+                    <option value="People & Society">People & Society</option>
+                    <option value="Pets & Animals">Pets & Animals</option>
+                    <option value="Real Estate">Real Estate</option>
+                    <option value="Science">Science</option>
+                    <option value="Shopping">Shopping</option>
+                    <option value="Sports">Sports</option>
+                    <option value="Travel">Travel</option>
                   </select>
                 </div>
               )}
@@ -897,7 +1480,9 @@ const Dashboard = () => {
                     }
                   `}</style>
                 </div>
-                <span className="text-xs text-gray-800">100</span>
+                <span className="text-xs font-medium text-gray-800 min-w-[2.5rem] text-right">
+                  {googleTrendScore}
+                </span>
               </div>
             </div>
           </div>
@@ -1236,6 +1821,18 @@ const Dashboard = () => {
           </button>
 
           <button
+            onClick={handleExportCsv}
+            disabled={pipelineStatus !== 'COMPLETED'}
+            className={`px-8 py-2 rounded font-bold transition-colors ${
+              pipelineStatus === 'COMPLETED'
+                ? 'bg-blue-500 text-black hover:bg-blue-400'
+                : 'bg-gray-600 text-gray-300 cursor-not-allowed'
+            }`}
+          >
+            EXPORT CSV
+          </button>
+
+          <button
             onClick={handleSearch}
             disabled={isLoading}
             className="px-8 py-2 bg-yellow-500 text-white font-bold rounded hover:bg-yellow-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1253,8 +1850,339 @@ const Dashboard = () => {
         </div>
 
         {/* Products Results Table */}
-        {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE') && (
+        {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE' || hasPerformedSearch) && (
           <div className="mt-8">
+            {/* Stage-level details (audit-only views) - always visible while pipeline is active */}
+            {activeSearch && pipelineStatus !== 'IDLE' && (
+              <div className="mb-10">
+                    {/* Category: keywords from Google Trends - show first */}
+                    {searchingMode === 'CATEGORY BASED' && categoryKeywordsPreview !== null && categoryKeywordsPreview.length > 0 && (
+                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/30">
+                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider mb-2">KEYWORDS FROM GOOGLE TRENDS</h3>
+                        <p className="text-sm text-gray-400 mb-4">Keywords generated for this category; one Step Function execution runs per keyword.</p>
+                        <div className="flex flex-wrap gap-2">
+                          {categoryKeywordsPreview.map((kw, idx) => (
+                            <span
+                              key={idx}
+                              className="px-3 py-1.5 bg-[#32402F] text-gray-100 rounded border border-white/20 text-sm"
+                            >
+                              {kw}
+                            </span>
+                          ))}
+                        </div>
+                        <p className="text-xs text-gray-500 mt-4">Total: {categoryKeywordsPreview.length} keyword(s)</p>
+                      </div>
+                    )}
+
+                    {/* Category Pipeline Tracker - show second (above stage results) */}
+                    {searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && (
+                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
+                          <div>
+                            <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">CATEGORY PIPELINE TRACKER</h3>
+                            <div className="text-xs text-gray-400">Each variant keyword runs its own pipeline.</div>
+                          </div>
+                          <div className="flex flex-col md:flex-row md:items-center gap-2">
+                            <span className="text-xs font-semibold text-gray-200 uppercase tracking-wide">Variant View</span>
+                            <select
+                              value={selectedCategoryVariant}
+                              onChange={(e) => handleCategoryVariantChange(e.target.value)}
+                              className="px-3 py-1 text-xs bg-[#32402F] text-white border border-white/40 rounded focus:outline-none focus:border-[#C0FE72]"
+                            >
+                              <option value="ALL">Select a variant</option>
+                              {categoryExecutions.map((exec) => (
+                                <option key={exec.keyword} value={exec.keyword}>
+                                  {exec.keyword}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-white/30 text-gray-300">
+                                <th className="pb-3 pr-4 font-semibold uppercase tracking-wider">Target Keyword</th>
+                                <th className="pb-3 px-4 font-semibold uppercase tracking-wider">Execution Status</th>
+                                <th className="pb-3 pl-4 font-semibold uppercase tracking-wider">Run ID / ARN</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {categoryExecutions.map((exec, idx) => (
+                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                  <td className="py-4 pr-4 font-medium text-white">{exec.keyword}</td>
+                                  <td className="py-4 px-4">
+                                    <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold tracking-tight shadow-sm ${exec.status === 'SUCCEEDED' ? 'bg-green-500/20 text-green-400 border border-green-500/30' :
+                                      exec.status === 'FAILED' ? 'bg-red-500/20 text-red-400 border border-red-500/30' :
+                                        exec.status === 'RUNNING' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse' :
+                                          'bg-gray-500/20 text-gray-400 border border-gray-500/30'
+                                      }`}>
+                                      <span className={`w-2 h-2 rounded-full mr-2 ${exec.status === 'SUCCEEDED' ? 'bg-green-400' :
+                                        exec.status === 'FAILED' ? 'bg-red-400' :
+                                          exec.status === 'RUNNING' ? 'bg-blue-400' :
+                                            'bg-gray-400'
+                                        }`}></span>
+                                      {exec.status || 'INITIALIZING'}
+                                    </span>
+                                  </td>
+                                  <td className="py-4 pl-4 font-mono text-[10px] text-gray-500 break-all max-w-xs">{exec.run_id || exec.execution_arn}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Stage results - below Category Pipeline Tracker; per selected variant only (no merge) */}
+                    {searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && selectedCategoryVariant !== 'ALL' && (
+                      <div className="mb-6 p-3 bg-[#32402F] rounded border border-[#C0FE72]/20">
+                        <p className="text-sm text-gray-300">
+                          Showing data for variant: <strong className="text-[#C0FE72]">{selectedCategoryVariant}</strong>
+                        </p>
+                      </div>
+                    )}
+                    {/* Category mode: selected variant produced no surviving stage data (all variants filtered out) */}
+                    {searchingMode === 'CATEGORY BASED' &&
+                      categoryExecutions.length > 0 &&
+                      selectedCategoryVariant !== 'ALL' &&
+                      pipelineStatus === 'COMPLETED' &&
+                      !keywordPlannerResults?.length &&
+                      !trendsResults?.length && (
+                        <div className="mb-6 p-4 bg-[#2a3627] rounded border border-red-400/40 text-center">
+                          <p className="text-sm text-gray-100 font-semibold">
+                            All candidate variants for this keyword were removed by the pipeline filters, so no stage files were written.
+                          </p>
+                          <p className="mt-2 text-xs text-gray-400">
+                            Try relaxing your filters (search volume, Google Trends score, marketplace filters) or choose another variant from the{' '}
+                            <strong className="text-[#C0FE72]">Variant View</strong> dropdown above.
+                          </p>
+                        </div>
+                      )}
+                    {/* Category mode: prompt to select a keyword to view stage data */}
+                    {searchingMode === 'CATEGORY BASED' && selectedCategoryVariant === 'ALL' && categoryExecutions.length > 0 && !keywordPlannerResults?.length && !trendsResults?.length && (
+                      <div className="mb-6 p-4 bg-[#2a3627] rounded border border-white/20 text-center">
+                        <p className="text-gray-300 text-sm">
+                          Select a keyword from the <strong className="text-[#C0FE72]">Variant View</strong> dropdown above to view <strong>Keyword Planner</strong>, <strong>Google Trends</strong>, <strong>Amazon</strong>, and <strong>Alibaba</strong> stage data for that keyword only.
+                        </p>
+                      </div>
+                    )}
+                    {/* Keyword Planner Stage Summary */}
+                    {(() => {
+                      const displayRows = filterStageRowsByVariant(keywordPlannerResults, ['root_keyword', 'sub_keyword', 'keyword'], 'root_keyword');
+                      const hasRawKwp = keywordPlannerResults && keywordPlannerResults.length > 0;
+                      const noMatchKwp = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawKwp && (!displayRows || displayRows.length === 0);
+                      if (noMatchKwp) {
+                        return (
+                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
+                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">KEYWORD PLANNER STAGE</h3>
+                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. The pipeline may have returned data for a related term (e.g. another variant in the list). Select that variant from the dropdown to see its rows.</p>
+                          </div>
+                        );
+                      }
+                      if (!displayRows || displayRows.length === 0) return null;
+                      return (
+                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                        <div className="flex justify-between items-center mb-4">
+                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">KEYWORD PLANNER STAGE</h3>
+                          <div className="text-sm text-gray-300">
+                            {keywordPlannerMeta?.message || 'Keyword Planner Parquet created'} · Rows: {keywordPlannerMeta?.rows ?? displayRows.length}
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-white/30 text-gray-300">
+                                {Object.keys(displayRows[0]).map((col) => (
+                                  <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                    {col.replace(/_/g, ' ')}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {displayRows.map((row, idx) => (
+                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                  {Object.keys(displayRows[0]).map((col) => (
+                                    <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                        ? String((row as any)[col])
+                                        : '-'}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                      );
+                    })()}
+
+                    {/* Google Trends Stage Summary */}
+                    {(() => {
+                      const displayRows = filterStageRowsByVariant(trendsResults, ['keyword'], 'keyword');
+                      const hasRawTrends = trendsResults && trendsResults.length > 0;
+                      const noMatchTrends = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawTrends && (!displayRows || displayRows.length === 0);
+                      if (noMatchTrends) {
+                        return (
+                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
+                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">GOOGLE TRENDS STAGE</h3>
+                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. Select another variant from the dropdown to see its data.</p>
+                          </div>
+                        );
+                      }
+                      if (!displayRows || displayRows.length === 0) return null;
+                      return (
+                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                        <div className="flex justify-between items-center mb-4">
+                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">GOOGLE TRENDS STAGE</h3>
+                          <div className="text-sm text-gray-300">
+                            {trendsMeta?.message || 'Google Trends Parquet created successfully'} · Rows: {trendsMeta?.rows ?? displayRows.length}
+                          </div>
+                        </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm text-left border-collapse">
+                        <thead>
+                          <tr className="border-b border-white/30 text-gray-300">
+                            {Object.keys(displayRows[0]).map((col) => (
+                              <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                {col === 'score_value' ? 'FCL' : col.replace(/_/g, ' ')}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {displayRows.map((row, idx) => (
+                            <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                              {Object.keys(displayRows[0]).map((col) => (
+                                <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                  {(() => {
+                                    const value = (row as any)[col];
+                                    if (value === undefined || value === null) return '-';
+                                    if (col === 'score_value') {
+                                      const num = Number(value);
+                                      return Number.isFinite(num) ? `${num.toFixed(2)}` : String(value);
+                                    }
+                                    return String(value);
+                                  })()}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                      </div>
+                      );
+                    })()}
+
+                    {/* Amazon Marketplace Stage */}
+                    {(() => {
+                      const displayRows = filterStageRowsByVariant(amazonResults, ['keyword', 'search_category'], 'keyword');
+                      const hasRawAmz = amazonResults && amazonResults.length > 0;
+                      const noMatchAmz = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawAmz && (!displayRows || displayRows.length === 0);
+                      if (noMatchAmz) {
+                        return (
+                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
+                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">AMAZON MARKETPLACE STAGE</h3>
+                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. Select another variant from the dropdown to see its data.</p>
+                          </div>
+                        );
+                      }
+                      if (!displayRows || displayRows.length === 0) return null;
+                      return (
+                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                        <div className="flex justify-between items-center mb-4">
+                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">AMAZON MARKETPLACE STAGE</h3>
+                          <div className="text-sm text-gray-300">
+                            {amazonMeta?.message || 'Amazon raw cleaned + converted to parquet'} · Rows: {amazonMeta?.rows ?? displayRows.length}
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-white/30 text-gray-300">
+                                {Object.keys(displayRows[0]).map((col) => (
+                                  <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                    {col.replace(/_/g, ' ')}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {displayRows.map((row, idx) => (
+                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                  {Object.keys(displayRows[0]).map((col) => (
+                                    <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                        ? String((row as any)[col])
+                                        : '-'}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                      );
+                    })()}
+
+                    {/* Alibaba Marketplace Stage */}
+                    {(() => {
+                      const displayRows = filterStageRowsByVariant(alibabaResults, ['keyword', 'search_category'], 'keyword');
+                      const hasRawAli = alibabaResults && alibabaResults.length > 0;
+                      const noMatchAli = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawAli && (!displayRows || displayRows.length === 0);
+                      if (noMatchAli) {
+                        return (
+                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
+                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">ALIBABA MARKETPLACE STAGE</h3>
+                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. Select another variant from the dropdown to see its data.</p>
+                          </div>
+                        );
+                      }
+                      if (!displayRows || displayRows.length === 0) return null;
+                      return (
+                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                        <div className="flex justify-between items-center mb-4">
+                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">ALIBABA MARKETPLACE STAGE</h3>
+                          <div className="text-sm text-gray-300">
+                            {alibabaMeta?.message || 'Alibaba raw cleaned + converted'} · Rows: {alibabaMeta?.rows ?? displayRows.length}
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-white/30 text-gray-300">
+                                {Object.keys(displayRows[0]).map((col) => (
+                                  <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                    {col.replace(/_/g, ' ')}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {displayRows.map((row, idx) => (
+                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                  {Object.keys(displayRows[0]).map((col) => (
+                                    <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                        ? String((row as any)[col])
+                                        : '-'}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                      );
+                    })()}
+              </div>
+            )}
+
             {error && (
               <div className="flex items-center justify-center min-h-[200px]">
                 <div className="text-center">
@@ -1296,15 +2224,18 @@ const Dashboard = () => {
               </div>
             )}
 
-            {products.length > 0 && pipelineStatus === 'COMPLETED' && (
+            {searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'COMPLETED' && (
               <>
-                <div className="text-center mb-6">
-                  <p className={`${isPreliminary ? 'text-yellow-500' : 'text-green-600'} text-4xl font-bold mb-2`}>
-                    {isPreliminary ? 'PRELIMINARY / PROCESSING' : 'SUCCEEDED'}
-                  </p>
-                  <p className="text-gray-600 text-lg">
-                    {isPreliminary ? 'Intermediate results found:' : `Found ${products.length} products`}
-                  </p>
+                <div className="flex justify-between items-center mb-4">
+                  <div className="text-xl font-bold text-white">
+                    Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                  </div>
+                  <div className="text-center">
+                    <p className={`${isPreliminary ? 'text-yellow-500' : 'text-green-600'} text-4xl font-bold mb-2`}>
+                      {isPreliminary ? 'PRELIMINARY / PROCESSING' : 'SUCCEEDED'}
+                    </p>
+                  </div>
+                  <div className="w-48"></div> {/* Spacer for symmetry */}
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
@@ -1330,6 +2261,7 @@ const Dashboard = () => {
                         </th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
@@ -1339,14 +2271,38 @@ const Dashboard = () => {
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {products.map((product, index) => (
-                        <tr
-                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
-                          className="group hover:bg-[#3d4d3a] transition-colors"
-                        >
+                      {products.map((product, index) => {
+                        const rowId = String(product.global_id || product.product_id || `${product.keyword || 'kw'}-${index}`);
+                        const isExpanded = expandedProductId === rowId;
+                        const kw = (product.keyword || '').toString().toLowerCase();
+
+                        const filterByKeyword = (rows: any[] | null | undefined, fields: string[]): any[] => {
+                          if (!rows || !kw) return [];
+                          return rows.filter((row) => {
+                            const text = fields
+                              .map((f) => ((row as any)[f] ?? '').toString().toLowerCase())
+                              .join(' ');
+                            return text.includes(kw);
+                          });
+                        };
+
+                        const kwpRows = filterByKeyword(keywordPlannerResults, ['keyword', 'sub_keyword', 'root_keyword']);
+                        const trendsRows = filterByKeyword(trendsResults, ['keyword']);
+                        const amzRows = filterByKeyword(amazonResults, ['keyword', 'search_category']);
+                        const aliRows = filterByKeyword(alibabaResults, ['keyword', 'search_category']);
+
+                        return (
+                          <React.Fragment key={rowId}>
+                            <tr
+                              className="group hover:bg-[#3d4d3a] transition-colors"
+                            >
                           <td
                             className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
                             style={{ minWidth: '120px', borderRight: '2px solid white' }}
@@ -1370,6 +2326,9 @@ const Dashboard = () => {
                           </td>
                           <td className="border border-white px-3 py-2">
                             {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
                           </td>
                           <td className="border border-white px-3 py-2">
                             {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
@@ -1398,22 +2357,202 @@ const Dashboard = () => {
                           <td className="border border-white px-3 py-2">
                             {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
                           </td>
-                        </tr>
-                      ))}
+                              <td className="border border-white px-3 py-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setExpandedProductId((current) => (current === rowId ? null : rowId));
+                                  }}
+                                  className="px-3 py-1 text-xs font-semibold rounded bg-white text-black hover:bg-gray-200 transition-colors"
+                                >
+                                  {isExpanded ? 'Hide specs' : 'Specs'}
+                                </button>
+                              </td>
+                            </tr>
+                            {isExpanded && (
+                              <tr className="bg-[#25301f]">
+                                <td colSpan={16} className="border-t border-white/20 px-3 py-3">
+                                  <div className="space-y-4">
+                                    {/* Keyword Planner specs */}
+                                    {kwpRows.length > 0 && (
+                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                        <div className="flex justify-between items-center mb-2">
+                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Keyword Planner details</h4>
+                                          <div className="text-[10px] text-gray-300">
+                                            Rows: {kwpRows.length}
+                                          </div>
+                                        </div>
+                                        <div className="overflow-x-auto">
+                                          <table className="w-full text-[11px] text-left border-collapse">
+                                            <thead>
+                                              <tr className="border-b border-white/30 text-gray-300">
+                                                {Object.keys(kwpRows[0]).map((col) => (
+                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                    {col.replace(/_/g, ' ')}
+                                                  </th>
+                                                ))}
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {kwpRows.map((row, idx2) => (
+                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                  {Object.keys(kwpRows[0]).map((col) => (
+                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                        ? String((row as any)[col])
+                                                        : '-'}
+                                                    </td>
+                                                  ))}
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Google Trends specs */}
+                                    {trendsRows.length > 0 && (
+                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                        <div className="flex justify-between items-center mb-2">
+                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Google Trends details</h4>
+                                          <div className="text-[10px] text-gray-300">
+                                            Rows: {trendsRows.length}
+                                          </div>
+                                        </div>
+                                        <div className="overflow-x-auto">
+                                          <table className="w-full text-[11px] text-left border-collapse">
+                                            <thead>
+                                              <tr className="border-b border-white/30 text-gray-300">
+                                                {Object.keys(trendsRows[0]).map((col) => (
+                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                    {col.replace(/_/g, ' ')}
+                                                  </th>
+                                                ))}
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {trendsRows.map((row, idx2) => (
+                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                  {Object.keys(trendsRows[0]).map((col) => (
+                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                        ? String((row as any)[col])
+                                                        : '-'}
+                                                    </td>
+                                                  ))}
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Amazon specs */}
+                                    {amzRows.length > 0 && (
+                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                        <div className="flex justify-between items-center mb-2">
+                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Amazon marketplace details</h4>
+                                          <div className="text-[10px] text-gray-300">
+                                            Rows: {amzRows.length}
+                                          </div>
+                                        </div>
+                                        <div className="overflow-x-auto">
+                                          <table className="w-full text-[11px] text-left border-collapse">
+                                            <thead>
+                                              <tr className="border-b border-white/30 text-gray-300">
+                                                {Object.keys(amzRows[0]).map((col) => (
+                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                    {col.replace(/_/g, ' ')}
+                                                  </th>
+                                                ))}
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {amzRows.map((row, idx2) => (
+                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                  {Object.keys(amzRows[0]).map((col) => (
+                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                        ? String((row as any)[col])
+                                                        : '-'}
+                                                    </td>
+                                                  ))}
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Alibaba specs */}
+                                    {aliRows.length > 0 && (
+                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                        <div className="flex justify-between items-center mb-2">
+                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Alibaba supplier details</h4>
+                                          <div className="text-[10px] text-gray-300">
+                                            Rows: {aliRows.length}
+                                          </div>
+                                        </div>
+                                        <div className="overflow-x-auto">
+                                          <table className="w-full text-[11px] text-left border-collapse">
+                                            <thead>
+                                              <tr className="border-b border-white/30 text-gray-300">
+                                                {Object.keys(aliRows[0]).map((col) => (
+                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                    {col.replace(/_/g, ' ')}
+                                                  </th>
+                                                ))}
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {aliRows.map((row, idx2) => (
+                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                  {Object.keys(aliRows[0]).map((col) => (
+                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                        ? String((row as any)[col])
+                                                        : '-'}
+                                                    </td>
+                                                  ))}
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {kwpRows.length === 0 && trendsRows.length === 0 && amzRows.length === 0 && aliRows.length === 0 && (
+                                      <p className="text-[11px] text-gray-300">
+                                        No stage-level rows were found matching this product&apos;s keyword.
+                                      </p>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })}
                     </tbody>
                   </table>
-                  <div className="mt-2 text-sm text-gray-300">
-                    Showing {products.length} product{products.length !== 1 ? 's' : ''}
-                  </div>
                 </div>
               </>
             )}
 
-            {products.length > 0 && pipelineStatus === 'POLLING' && isPreliminary && (
+            {searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'POLLING' && isPreliminary && (
               <>
-                <div className="text-center mb-6">
-                  <p className="text-yellow-500 text-4xl font-bold mb-2">PRELIMINARY / PROCESSING</p>
-                  <p className="text-gray-600 text-lg">Intermediate results found: {products.length}</p>
+                <div className="flex justify-between items-center mb-4">
+                  <div className="text-xl font-bold text-white">
+                    Total Products: <span className="text-yellow-500">{products.length}</span>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-yellow-500 text-4xl font-bold mb-2">PRELIMINARY / PROCESSING</p>
+                  </div>
+                  <div className="w-48"></div> {/* Spacer for symmetry */}
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm opacity-70">
@@ -1439,6 +2578,7 @@ const Dashboard = () => {
                         </th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
                         <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
@@ -1481,6 +2621,9 @@ const Dashboard = () => {
                             {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
                           </td>
                           <td className="border border-white px-3 py-2">
+                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
                             {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
                           </td>
                           <td className="border border-white px-3 py-2">
@@ -1515,106 +2658,128 @@ const Dashboard = () => {
               </>
             )}
 
-            {products.length > 0 && pipelineStatus === 'IDLE' && (
-              <div className="overflow-x-auto">
-                <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
-                  <thead>
-                    <tr className="bg-yellow-500 text-black">
-                      <th
-                        className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
-                        style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                      >
-                        Global ID
-                      </th>
-                      <th
-                        className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                        style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                      >
-                        Keyword
-                      </th>
-                      <th
-                        className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                        style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                      >
-                        Title
-                      </th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
-                      <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {products.map((product, index) => (
-                      <tr
-                        key={`${product.global_id || product.product_id || 'prod'}-${index}`}
-                        className="group hover:bg-[#3d4d3a] transition-colors"
-                      >
-                        <td
-                          className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+            {searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'IDLE' && (
+              <div className="mt-8">
+                <div className="flex justify-between items-center mb-4 border-b border-white/20 pb-4">
+                  <h2 className="text-2xl font-bold tracking-wider">PRODUCT RESULTS</h2>
+                  <div className="text-xl font-bold text-white">
+                    Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
+                    <thead>
+                      <tr className="bg-yellow-500 text-black">
+                        <th
+                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
                           style={{ minWidth: '120px', borderRight: '2px solid white' }}
                         >
-                          {product.global_id || '-'}
-                        </td>
-                        <td
-                          className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                          Global ID
+                        </th>
+                        <th
+                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
                           style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
                         >
-                          {product.keyword ? toTitleCase(product.keyword) : '-'}
-                        </td>
-                        <td
-                          className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                          Keyword
+                        </th>
+                        <th
+                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
                           style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
                         >
-                          {product.title || '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
-                        </td>
-
-                        <td className="border border-white px-3 py-2">
-                          {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
-                        </td>
-                        <td className="border border-white px-3 py-2">
-                          {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
-                        </td>
+                          Title
+                        </th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
+                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <div className="mt-2 text-sm text-gray-300">
-                  Showing {products.length} product{products.length !== 1 ? 's' : ''}
+                    </thead>
+                    <tbody>
+                      {products.map((product, index) => (
+                        <tr
+                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
+                          className="group hover:bg-[#3d4d3a] transition-colors"
+                        >
+                          <td
+                            className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            style={{ minWidth: '120px', borderRight: '2px solid white' }}
+                          >
+                            {product.global_id || '-'}
+                          </td>
+                          <td
+                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                          >
+                            {product.keyword ? toTitleCase(product.keyword) : '-'}
+                          </td>
+                          <td
+                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                          >
+                            {product.title || '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
+                          </td>
+                          <td className="border border-white px-3 py-2">
+                            {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {searchingMode !== 'CATEGORY BASED' && products.length === 0 && !isLoading && !error && hasPerformedSearch && (
+              <div className="flex flex-col items-center justify-center min-h-[300px] bg-[#32402F] rounded-lg border border-white/20">
+                <div className="text-center">
+                  <p className="text-[#C0FE72] text-4xl font-bold mb-4">NO RESULTS FOUND</p>
+                  <p className="text-gray-300 text-lg">We couldn't find any products matching your criteria.</p>
+                  <button
+                    onClick={handleReset}
+                    className="mt-6 px-6 py-2 bg-yellow-500 text-black font-bold rounded hover:bg-yellow-400 transition-colors"
+                  >
+                    CLEAR FILTERS
+                  </button>
                 </div>
               </div>
             )}
@@ -1626,11 +2791,6 @@ const Dashboard = () => {
 };
 
 export default Dashboard;
-
-
-
-
-
 
 
 

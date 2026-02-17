@@ -5,13 +5,13 @@ import { parquetMetadata, parquetRead, parquetReadObjects } from "hyparquet";
 
 const s3Client = new S3Client({
     region: process.env.AWS_REGION || "eu-north-1",
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    },
+    // credentials: {
+    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+    // },
 });
 
-export async function fetchProductsFromS3(search_mode: string = 'manual_search') {
+export async function fetchProductsFromS3(search_mode: string = 'manual_search', amazonFilters: boolean = true, alibabaFilters: boolean = true) {
     const bucket = process.env.S3_RANKED_BUCKET;
     if (!bucket) {
         console.warn("S3_RANKED_BUCKET is not defined. Falling back to atai-clean-layer.");
@@ -20,7 +20,12 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search')
 
     try {
         if (search_mode === 'category_search') {
-            const prefix = "consolidated/category_search/";
+            let prefix = "ranked/category_search/product_related/";
+
+            if (!amazonFilters && !alibabaFilters) {
+                prefix = "ranked/category_search/only_keyword/";
+                console.log("Both Amazon and Alibaba filters disabled. Using prefix:", prefix);
+            }
             const listCommand = new ListObjectsV2Command({
                 Bucket: targetBucket,
                 Prefix: prefix
@@ -59,7 +64,14 @@ export async function fetchProductsFromS3(search_mode: string = 'manual_search')
             return allProducts;
         } else {
             // Default to manual search single file
-            const key = process.env.S3_RANKED_KEY || "ranked/manual_search/ranked_results.parquet";
+            // Case: Both Amazon and Alibaba filters disabled -> Use specific Key
+            let key = process.env.S3_RANKED_KEY || "ranked/manual_search/ranked_results.parquet";
+
+            if (!amazonFilters && !alibabaFilters) {
+                key = "ranked/manual_search/only_keyword/ranked_results.parquet";
+                console.log("Both Amazon and Alibaba filters disabled. Using key:", key);
+            }
+
             console.log(`Fetching products from S3 bucket: ${targetBucket}, key: ${key}`);
 
             try {
@@ -121,3 +133,6 @@ function jsonSafeParse<T>(str: string, fallback: T): T {
         return fallback;
     }
 }
+
+
+

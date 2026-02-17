@@ -20,6 +20,7 @@ export async function POST(request: NextRequest) {
         const result = await startPipelineExecution(keyword, filters, search_mode);
 
         return NextResponse.json({
+            execution_details: result.execution_details,
             success: result.status !== 'FAILED',
             executionArn: result.executionArn,
             message: result.message
@@ -33,3 +34,6 @@ export async function POST(request: NextRequest) {
         );
     }
 }
+
+
+
