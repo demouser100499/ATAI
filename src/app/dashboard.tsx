@@ -120,36 +120,12 @@ const Dashboard = () => {
   const pipelineFieldsDisabled = pipelineStatus === 'COMPLETED'; // For VARIANT LIMIT MAX, RESULTS CAP MAX, TREND PERIOD
   const fieldsDisabled = false; // KEYWORD SEARCH and LOCATION are never disabled
 
-  // Helper: get value from row by exact key or by matching key (normalize: lowercase, underscores/spaces collapsed).
-  const getRowKeywordValue = (row: Record<string, unknown>, primaryKey: string): unknown => {
-    if (row[primaryKey] !== undefined && row[primaryKey] !== null) return row[primaryKey];
-    const normalizedPrimary = primaryKey.toLowerCase().replace(/[\s_]+/g, ' ');
-    for (const key of Object.keys(row)) {
-      const normalizedKey = key.toLowerCase().replace(/_/g, ' ');
-      if (normalizedKey === normalizedPrimary) return row[key];
-    }
-    return undefined;
-  };
-
-  // Helper: in category mode with a variant selected, filter stage rows to only those whose primary keyword matches the selected variant (normalized).
+  // Helper: currently a passthrough – stage data is already scoped per execution ARN.
   const filterStageRowsByVariant = useCallback(
     (rows: any[] | null, fields: string[], primaryKeywordField?: string): any[] | null => {
-      if (!rows || rows.length === 0) return rows;
-      const variant = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant && selectedCategoryVariant !== 'ALL'
-        ? selectedCategoryVariant.trim().toLowerCase().replace(/\s+/g, ' ')
-        : null;
-      if (!variant) return rows;
-
-      const primary = primaryKeywordField ?? fields[0];
-      const normalize = (v: unknown) =>
-        (v != null ? String(v).trim().toLowerCase().replace(/\s+/g, ' ') : '');
-
-      return rows.filter((row) => {
-        const val = getRowKeywordValue(row as Record<string, unknown>, primary);
-        return normalize(val) === variant;
-      });
+      return rows;
     },
-    [searchingMode, selectedCategoryVariant]
+    []
   );
 
   // Export current pipeline execution's stage data (KWP, Trends, Amazon, Alibaba) as a single Excel file with one sheet per stage.
@@ -907,33 +883,49 @@ const Dashboard = () => {
 
         if (kwpRes?.ok) {
           const kwpData = await kwpRes.json();
-          if (!cancelled && kwpData.success && kwpData.available && kwpData.results?.length > 0) {
-            setKeywordPlannerResults(kwpData.results);
-            setKeywordPlannerMeta(kwpData.meta || null);
+          if (!cancelled) {
+            if (kwpData.success && kwpData.available && kwpData.results?.length > 0) {
+              setKeywordPlannerResults(kwpData.results);
+            }
+            if (kwpData.meta !== undefined) {
+              setKeywordPlannerMeta(kwpData.meta || null);
+            }
             setHasLoadedKeywordPlanner(true);
           }
         }
         if (trendsRes?.ok) {
           const trendsData = await trendsRes.json();
-          if (!cancelled && trendsData.success && trendsData.available && trendsData.results?.length > 0) {
-            setTrendsResults(trendsData.results);
-            setTrendsMeta(trendsData.meta || null);
+          if (!cancelled) {
+            if (trendsData.success && trendsData.available && trendsData.results?.length > 0) {
+              setTrendsResults(trendsData.results);
+            }
+            if (trendsData.meta !== undefined) {
+              setTrendsMeta(trendsData.meta || null);
+            }
             setHasLoadedTrends(true);
           }
         }
         if (amzRes?.ok) {
           const amzData = await amzRes.json();
-          if (!cancelled && amzData.success && amzData.available && amzData.results?.length > 0) {
-            setAmazonResults(amzData.results);
-            setAmazonMeta(amzData.meta || null);
+          if (!cancelled) {
+            if (amzData.success && amzData.available && amzData.results?.length > 0) {
+              setAmazonResults(amzData.results);
+            }
+            if (amzData.meta !== undefined) {
+              setAmazonMeta(amzData.meta || null);
+            }
             setHasLoadedAmazon(true);
           }
         }
         if (aliRes?.ok) {
           const aliData = await aliRes.json();
-          if (!cancelled && aliData.success && aliData.available && aliData.results?.length > 0) {
-            setAlibabaResults(aliData.results);
-            setAlibabaMeta(aliData.meta || null);
+          if (!cancelled) {
+            if (aliData.success && aliData.available && aliData.results?.length > 0) {
+              setAlibabaResults(aliData.results);
+            }
+            if (aliData.meta !== undefined) {
+              setAlibabaMeta(aliData.meta || null);
+            }
             setHasLoadedAlibaba(true);
           }
         }
@@ -1011,9 +1003,11 @@ const Dashboard = () => {
                   const kwpData = await kwpRes.json();
                   if (kwpData.success && kwpData.available && kwpData.results && kwpData.results.length > 0) {
                     setKeywordPlannerResults(kwpData.results);
-                    setKeywordPlannerMeta(kwpData.meta || null);
-                    setHasLoadedKeywordPlanner(true);
                   }
+                  if (kwpData.meta !== undefined) {
+                    setKeywordPlannerMeta(kwpData.meta || null);
+                  }
+                  setHasLoadedKeywordPlanner(true);
                 }
               } catch (e) {
                 console.log("Error fetching Keyword Planner stage results", e);
@@ -1028,9 +1022,11 @@ const Dashboard = () => {
                   const trendsData = await trendsRes.json();
                   if (trendsData.success && trendsData.available && trendsData.results && trendsData.results.length > 0) {
                     setTrendsResults(trendsData.results);
-                    setTrendsMeta(trendsData.meta || null);
-                    setHasLoadedTrends(true);
                   }
+                  if (trendsData.meta !== undefined) {
+                    setTrendsMeta(trendsData.meta || null);
+                  }
+                  setHasLoadedTrends(true);
                 }
               } catch (e) {
                 console.log("Error fetching Google Trends stage results", e);
@@ -1046,9 +1042,11 @@ const Dashboard = () => {
                   console.log("Amazon marketplace stage response:", amzData);
                   if (amzData.success && amzData.available && amzData.results && amzData.results.length > 0) {
                     setAmazonResults(amzData.results);
-                    setAmazonMeta(amzData.meta || null);
-                    setHasLoadedAmazon(true);
                   }
+                  if (amzData.meta !== undefined) {
+                    setAmazonMeta(amzData.meta || null);
+                  }
+                  setHasLoadedAmazon(true);
                 }
               } catch (e) {
                 console.log("Error fetching Amazon marketplace stage results", e);
@@ -1064,9 +1062,11 @@ const Dashboard = () => {
                   console.log("Alibaba marketplace stage response:", aliData);
                   if (aliData.success && aliData.available && aliData.results && aliData.results.length > 0) {
                     setAlibabaResults(aliData.results);
-                    setAlibabaMeta(aliData.meta || null);
-                    setHasLoadedAlibaba(true);
                   }
+                  if (aliData.meta !== undefined) {
+                    setAlibabaMeta(aliData.meta || null);
+                  }
+                  setHasLoadedAlibaba(true);
                 }
               } catch (e) {
                 console.log("Error fetching Alibaba marketplace stage results", e);
@@ -1942,11 +1942,14 @@ const Dashboard = () => {
                         </p>
                       </div>
                     )}
-                    {/* Category mode: selected variant produced no surviving stage data (all variants filtered out) */}
+                    {/* Category mode: selected variant produced no surviving stage data (all variants filtered out).
+                        Only show after Keyword Planner + Trends stages have both completed and returned no rows. */}
                     {searchingMode === 'CATEGORY BASED' &&
                       categoryExecutions.length > 0 &&
                       selectedCategoryVariant !== 'ALL' &&
                       pipelineStatus === 'COMPLETED' &&
+                      hasLoadedKeywordPlanner &&
+                      hasLoadedTrends &&
                       !keywordPlannerResults?.length &&
                       !trendsResults?.length && (
                         <div className="mb-6 p-4 bg-[#2a3627] rounded border border-red-400/40 text-center">
@@ -1970,16 +1973,6 @@ const Dashboard = () => {
                     {/* Keyword Planner Stage Summary */}
                     {(() => {
                       const displayRows = filterStageRowsByVariant(keywordPlannerResults, ['root_keyword', 'sub_keyword', 'keyword'], 'root_keyword');
-                      const hasRawKwp = keywordPlannerResults && keywordPlannerResults.length > 0;
-                      const noMatchKwp = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawKwp && (!displayRows || displayRows.length === 0);
-                      if (noMatchKwp) {
-                        return (
-                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
-                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">KEYWORD PLANNER STAGE</h3>
-                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. The pipeline may have returned data for a related term (e.g. another variant in the list). Select that variant from the dropdown to see its rows.</p>
-                          </div>
-                        );
-                      }
                       if (!displayRows || displayRows.length === 0) return null;
                       return (
                       <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
@@ -2022,16 +2015,6 @@ const Dashboard = () => {
                     {/* Google Trends Stage Summary */}
                     {(() => {
                       const displayRows = filterStageRowsByVariant(trendsResults, ['keyword'], 'keyword');
-                      const hasRawTrends = trendsResults && trendsResults.length > 0;
-                      const noMatchTrends = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawTrends && (!displayRows || displayRows.length === 0);
-                      if (noMatchTrends) {
-                        return (
-                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
-                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">GOOGLE TRENDS STAGE</h3>
-                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. Select another variant from the dropdown to see its data.</p>
-                          </div>
-                        );
-                      }
                       if (!displayRows || displayRows.length === 0) return null;
                       return (
                       <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
@@ -2080,16 +2063,6 @@ const Dashboard = () => {
                     {/* Amazon Marketplace Stage */}
                     {(() => {
                       const displayRows = filterStageRowsByVariant(amazonResults, ['keyword', 'search_category'], 'keyword');
-                      const hasRawAmz = amazonResults && amazonResults.length > 0;
-                      const noMatchAmz = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawAmz && (!displayRows || displayRows.length === 0);
-                      if (noMatchAmz) {
-                        return (
-                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
-                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">AMAZON MARKETPLACE STAGE</h3>
-                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. Select another variant from the dropdown to see its data.</p>
-                          </div>
-                        );
-                      }
                       if (!displayRows || displayRows.length === 0) return null;
                       return (
                       <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
@@ -2132,16 +2105,6 @@ const Dashboard = () => {
                     {/* Alibaba Marketplace Stage */}
                     {(() => {
                       const displayRows = filterStageRowsByVariant(alibabaResults, ['keyword', 'search_category'], 'keyword');
-                      const hasRawAli = alibabaResults && alibabaResults.length > 0;
-                      const noMatchAli = searchingMode === 'CATEGORY BASED' && selectedCategoryVariant !== 'ALL' && hasRawAli && (!displayRows || displayRows.length === 0);
-                      if (noMatchAli) {
-                        return (
-                          <div className="mb-8 p-4 bg-[#2a3627] rounded border border-amber-500/40">
-                            <h3 className="text-xl font-bold text-[#C0FE72] tracking-wider mb-2">ALIBABA MARKETPLACE STAGE</h3>
-                            <p className="text-sm text-gray-300">No rows match the selected variant <strong className="text-amber-400">&quot;{selectedCategoryVariant}&quot;</strong>. Select another variant from the dropdown to see its data.</p>
-                          </div>
-                        );
-                      }
                       if (!displayRows || displayRows.length === 0) return null;
                       return (
                       <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
