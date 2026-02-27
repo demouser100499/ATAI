@@ -20,6 +20,31 @@ const countries = [
   { name: 'Chile', code: 'CL' }
 ];
 
+// Google Trends Trending Now categories → GT numeric ID
+// Source: URL param ?category=N on https://trends.google.com/trending
+const GT_CATEGORIES = [
+  { name: 'All categories', id: 0 },
+  { name: 'Autos and Vehicles', id: 1 },
+  { name: 'Beauty and Fashion', id: 2 },
+  { name: 'Business and Finance', id: 3 },
+  { name: 'Climate', id: 21 },
+  { name: 'Entertainment', id: 13 },
+  { name: 'Food and Drink', id: 14 },
+  { name: 'Games', id: 15 },
+  { name: 'Health', id: 8 },
+  { name: 'Hobbies and Leisure', id: 20 },
+  { name: 'Jobs and Education', id: 61 },
+  { name: 'Law and Government', id: 87 },
+  { name: 'Other', id: 70 },
+  { name: 'Pets and Animals', id: 66 },
+  { name: 'Politics', id: 32 },
+  { name: 'Science', id: 16 },
+  { name: 'Shopping', id: 18 },
+  { name: 'Sports', id: 7 },
+  { name: 'Technology', id: 12 },
+  { name: 'Travel and Transportation', id: 4 },
+];
+
 const Dashboard = () => {
   // Add client-side only rendering to prevent hydration mismatch
   const [isClient, setIsClient] = useState(false);
@@ -68,6 +93,7 @@ const Dashboard = () => {
   const [pollingIntervalRef, setPollingIntervalRef] = useState<NodeJS.Timeout | null>(null);
   const [isPreliminary, setIsPreliminary] = useState(false);
   const [hasPerformedSearch, setHasPerformedSearch] = useState(false);
+  const [consolidatedResults, setConsolidatedResults] = useState<any[]>([]);
   const [categoryExecutions, setCategoryExecutions] = useState<{ keyword: string, run_id: string, execution_arn: string, status?: string }[]>([]);
   // Category test mode: keywords from Google Trends only (no pipeline trigger)
   const [categoryKeywordsPreview, setCategoryKeywordsPreview] = useState<string[] | null>(null);
@@ -176,6 +202,11 @@ const Dashboard = () => {
         parse(amzRes),
         parse(aliRes),
       ]);
+
+      // ── Sheet 1: Consolidated Results (always first if present)
+      if (consolidatedResults.length > 0) {
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(consolidatedResults), 'Consolidated Results');
+      }
 
       if (kwpRows?.length) {
         XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(kwpRows), 'Keyword Planner');
@@ -457,6 +488,270 @@ const Dashboard = () => {
     setTrendPeriodError('');
   };
 
+  // ─── Consolidation + Scoring ─────────────────────────────────────────────
+  // Merges the four in-memory stage arrays (KWP, Trends, Amazon, Alibaba) and
+  // computes a final score + rank for each row. Called when the pipeline SUCCEEDS.
+  const buildConsolidated = useCallback((
+    optKwp?: any[],
+    optTrends?: any[],
+    optAmz?: any[],
+    optAli?: any[]
+  ) => {
+    // We anchor on Amazon rows (products). If Amazon is disabled, fall back to KWP keywords.
+    const amzRows: any[] = optAmz ?? (amazonResults && amazonResults.length > 0 ? amazonResults : []);
+    const aliRows: any[] = optAli ?? (alibabaResults && alibabaResults.length > 0 ? alibabaResults : []);
+    const kwpRows: any[] = optKwp ?? (keywordPlannerResults && keywordPlannerResults.length > 0 ? keywordPlannerResults : []);
+    const trendRows: any[] = optTrends ?? (trendsResults && trendsResults.length > 0 ? trendsResults : []);
+
+    // Determine seed rows: KWP keywords first (user-requested), fall back to Amazon if KWP is empty
+    const seedRows: any[] = kwpRows.length > 0 ? kwpRows : amzRows;
+    if (seedRows.length === 0) return;
+
+    // Fuzzy join helper — handles the root-keyword vs KWP-variant mismatch.
+    // Amazon/Alibaba are fetched with the ROOT keyword ("earphones") while KWP
+    // produces VARIANTS ("audio headphones", "bose ear buds", etc.).
+    // Priority: 1) exact match  2) bidirectional inclusion  3) title-word overlap  4) first-row fallback
+    const matchFuzzy = (arr: any[], kwpKw: string, kwFields: string[], titleField?: string): any | null => {
+      if (!arr.length) return null;
+      if (!kwpKw) return arr[0] ?? null;
+      const kw = kwpKw.toLowerCase().trim();
+      const kwWords = kw.split(/\s+/).filter((w) => w.length > 2);
+
+      // 1. Exact keyword match (works for Google Trends which uses KWP variants directly)
+      const exact = arr.find((r) =>
+        kwFields.some((f) => (r[f] ?? '').toString().toLowerCase() === kw)
+      );
+      if (exact) return exact;
+
+      // 2. Bidirectional inclusion: Amazon kw ⊂ KWP kw, or KWP kw ⊂ Amazon kw
+      //    e.g. Amazon kw="earphones", KWP kw="bose earphones" → "earphones" ⊂ KWP kw  ✓
+      const bidir = arr.find((r) =>
+        kwFields.some((f) => {
+          const val = (r[f] ?? '').toString().toLowerCase();
+          return val && (kw.includes(val) || val.includes(kw));
+        })
+      );
+      if (bidir) return bidir;
+
+      // 3. Title-word overlap: ≥50% of KWP keyword words appear in product title
+      if (titleField && kwWords.length > 0) {
+        const titleMatch = arr.find((r) => {
+          const title = (r[titleField] ?? '').toString().toLowerCase();
+          const hits = kwWords.filter((w) => title.includes(w)).length;
+          return hits >= Math.ceil(kwWords.length * 0.5);
+        });
+        if (titleMatch) return titleMatch;
+      }
+
+      // 4. Fallback — all rows share the same root search, so any row is contextually valid
+      return arr[0] ?? null;
+    };
+
+    // Collect all numeric values for normalisation
+    const allSearchVol: number[] = [];
+    const allTrendPeak: number[] = [];
+    const allReviews: number[] = [];
+    const allPrices: number[] = [];
+    const allMoq: number[] = [];
+    const allRating: number[] = [];
+
+    seedRows.forEach((row) => {
+      const kw = (row.keyword ?? row.sub_keyword ?? row.root_keyword ?? '').toString();
+      // KWP self-match (exact, since seed is KWP)
+      const kwpMatch = matchFuzzy(kwpRows, kw, ['keyword', 'sub_keyword', 'root_keyword']);
+      // Trends shares KWP variants — exact match works
+      const trendMatch = matchFuzzy(trendRows, kw, ['keyword']);
+      // Amazon/Alibaba use root keyword — fuzzy with title fallback
+      const amzMatch = matchFuzzy(amzRows, kw, ['keyword', 'search_category'], 'title');
+      const aliMatch = matchFuzzy(aliRows, kw, ['keyword', 'search_category'], 'title');
+
+      const sv = Number(kwpMatch?.avg_monthly_searches ?? row.avg_monthly_searches ?? 0);
+      const tp = Number(trendMatch?.gt_interest_peak ?? trendMatch?.interest_peak ?? 0);
+      const reviews = Number(amzMatch?.reviews_count ?? 0);
+      const price = Number(amzMatch?.amazon_price_usd ?? amzMatch?.base_price_usd ?? 0);
+      const moq = Number(aliMatch?.moq ?? 0);
+      const rating = Number(amzMatch?.rating ?? aliMatch?.supplier_rating ?? 0);
+
+      if (sv > 0) allSearchVol.push(sv);
+      if (tp > 0) allTrendPeak.push(tp);
+      if (reviews > 0) allReviews.push(reviews);
+      if (price > 0) allPrices.push(price);
+      if (moq > 0) allMoq.push(moq);
+      if (rating > 0) allRating.push(rating);
+    });
+
+    const maxOrOne = (arr: number[]) => arr.length > 0 ? Math.max(...arr) : 1;
+    const maxSV = maxOrOne(allSearchVol);
+    const maxTP = maxOrOne(allTrendPeak);
+    const maxReviews = maxOrOne(allReviews);
+    const maxPrice = maxOrOne(allPrices);
+    const maxMoq = maxOrOne(allMoq);
+    const maxRating = maxOrOne(allRating);
+
+    const scored = seedRows.map((row) => {
+      const kw = (row.keyword ?? row.sub_keyword ?? row.root_keyword ?? '').toString();
+      // Match each source — KWP/Trends by exact variant, Amazon/Alibaba by fuzzy
+      const kwpMatch = matchFuzzy(kwpRows, kw, ['keyword', 'sub_keyword', 'root_keyword']);
+      const trendMatch = matchFuzzy(trendRows, kw, ['keyword']);
+      const amzMatch = matchFuzzy(amzRows, kw, ['keyword', 'search_category'], 'title');
+      const aliMatch = matchFuzzy(aliRows, kw, ['keyword', 'search_category'], 'title');
+
+      // ── KWP fields (from KWP seed row itself or kwpMatch)
+      const avgMonthlySearches = Number(kwpMatch?.avg_monthly_searches ?? row.avg_monthly_searches ?? 0);
+      const cpcUsd = Number(kwpMatch?.cpc_usd ?? row.cpc_usd ?? 0);
+      const competitionIndex = kwpMatch?.competition_index ?? row.competition_index ?? '-';
+      const trendDirection = kwpMatch?.trend_direction ?? row.trend_direction ?? '-';
+
+      // ── Google Trends fields
+      const trendPeak = Number(trendMatch?.gt_interest_peak ?? 0);
+      const trendAvg = Number(trendMatch?.gt_interest_avg ?? 0);
+      const gtInterestTrend = trendMatch?.gt_interest_trend ?? '-';
+      const gtInterestChangePct = trendMatch?.gt_interest_change_pct ?? null;
+
+      // ── Amazon fields (from fuzzy-matched Amazon row)
+      const amazonTitle = amzMatch?.title ?? '-';
+      const asin = amzMatch?.a_sin ?? amzMatch?.asin ?? '-';
+      const amazonPrice = Number(amzMatch?.amazon_price_usd ?? amzMatch?.base_price_usd ?? 0);
+      const reviews = Number(amzMatch?.reviews_count ?? 0);
+      const rating = Number(amzMatch?.rating ?? 0);
+      const bestsellerRank = amzMatch?.bestseller_rank ?? '-';
+
+      // ── Alibaba fields (from fuzzy-matched Alibaba row)
+      const aliTitle = aliMatch?.title ?? '-';
+      const moq = Number(aliMatch?.moq ?? 0);
+      const supplierRating = Number(aliMatch?.supplier_rating ?? 0);
+      const supplierCountry = aliMatch?.supplier_country ?? '-';
+      const aliCategory = aliMatch?.category ?? '-';
+
+      // ── Scores (0–100)
+      const demandScore = maxSV > 0 ? Math.round((avgMonthlySearches / maxSV) * 100) : 0;
+      const trendScore = maxTP > 0 ? Math.round((trendPeak / maxTP) * 100) : 0;
+      // Lower Amazon reviews = less competition (easier market entry)
+      const competitionScore = maxReviews > 0 ? Math.round((1 - Math.min(reviews / maxReviews, 1)) * 100) : 100;
+      const priceScore = maxPrice > 0 && amazonPrice > 0 ? Math.round(Math.min((amazonPrice / maxPrice) * 100, 100)) : 0;
+      const supplierScore = Math.round(
+        (supplierRating > 0 && maxRating > 0 ? (supplierRating / maxRating) * 50 : 0) +
+        (moq > 0 && maxMoq > 0 ? (1 - Math.min(moq / maxMoq, 1)) * 50 : 0)
+      );
+
+      // Weighted final: Demand 35% · Trend 30% · Competition 15% · Supplier 10% · Price 10%
+      const finalScore = Math.round(
+        demandScore * 0.35 +
+        trendScore * 0.30 +
+        competitionScore * 0.15 +
+        supplierScore * 0.10 +
+        priceScore * 0.10
+      );
+
+      return {
+        // Identifiers
+        keyword: kw,
+        // KWP
+        avg_monthly_searches: avgMonthlySearches || null,
+        cpc_usd: cpcUsd || null,
+        competition_index: competitionIndex,
+        kwp_trend_direction: trendDirection,
+        // Google Trends
+        trend_peak: trendPeak || null,
+        trend_avg: trendAvg ? Number(trendAvg.toFixed(1)) : null,
+        gt_interest_trend: gtInterestTrend,
+        gt_interest_change_pct: gtInterestChangePct,
+        // Amazon
+        amazon_title: amazonTitle,
+        asin,
+        amazon_price_usd: amazonPrice || null,
+        reviews_count: reviews || null,
+        rating: rating || null,
+        bestseller_rank: bestsellerRank,
+        // Alibaba
+        alibaba_title: aliTitle,
+        moq: moq || null,
+        supplier_rating: supplierRating || null,
+        supplier_country: supplierCountry,
+        ali_category: aliCategory,
+        // Scores
+        demand_score: demandScore,
+        trend_score: trendScore,
+        competition_score: competitionScore,
+        supplier_score: supplierScore,
+        price_score: priceScore,
+        final_score: finalScore,
+      };
+    });
+
+    // Rank by final_score descending
+    const ranked = [...scored]
+      .sort((a, b) => b.final_score - a.final_score)
+      .map((row, i) => ({ rank: i + 1, ...row }));
+
+    setConsolidatedResults(ranked);
+  }, [amazonResults, alibabaResults, keywordPlannerResults, trendsResults]);
+
+  // Trigger consolidation once the pipeline succeeds
+  useEffect(() => {
+    if (pipelineStatus !== 'COMPLETED') return;
+
+    if (searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0) {
+      // Category mode: aggregate data from ALL individual keyword executions
+      setStatusMessage('Aggregating stage data for all variants...');
+
+      let isCancelled = false;
+      const aggregateCategoryData = async () => {
+        try {
+          const fetchPromises = categoryExecutions.map(async (exec) => {
+            const arn = exec.execution_arn;
+            if (!arn || exec.status !== 'SUCCEEDED') {
+              return { kwp: [], trends: [], amz: [], ali: [] };
+            }
+
+            const [kwpRes, trendsRes, amzRes, aliRes] = await Promise.all([
+              fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arn)}`).catch(() => null),
+              fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arn)}`).catch(() => null),
+              amazonFilters ? fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arn)}`).catch(() => null) : Promise.resolve(null),
+              alibabaFilters ? fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arn)}`).catch(() => null) : Promise.resolve(null),
+            ]);
+
+            const kwpData = kwpRes?.ok ? await kwpRes.json().catch(() => null) : null;
+            const trendsData = trendsRes?.ok ? await trendsRes.json().catch(() => null) : null;
+            const amzData = amzRes?.ok ? await amzRes.json().catch(() => null) : null;
+            const aliData = aliRes?.ok ? await aliRes.json().catch(() => null) : null;
+
+            return {
+              kwp: kwpData?.success && kwpData?.available ? (kwpData.results || []) : [],
+              trends: trendsData?.success && trendsData?.available ? (trendsData.results || []) : [],
+              amz: amzData?.success && amzData?.available ? (amzData.results || []) : [],
+              ali: aliData?.success && aliData?.available ? (aliData.results || []) : [],
+            };
+          });
+
+          const results = await Promise.all(fetchPromises);
+          if (isCancelled) return;
+
+          // Merge all child arrays
+          const megaKwp = results.flatMap(r => r.kwp);
+          const megaTrends = results.flatMap(r => r.trends);
+          const megaAmz = results.flatMap(r => r.amz);
+          const megaAli = results.flatMap(r => r.ali);
+
+          // Force the consolidator to generate the scoreboard covering ALL variants
+          buildConsolidated(megaKwp, megaTrends, megaAmz, megaAli);
+          setStatusMessage('Category Pipeline completed! View stage data below.');
+
+        } catch (e) {
+          console.error("Error aggregating category data", e);
+        }
+      };
+
+      aggregateCategoryData();
+      return () => { isCancelled = true; };
+    } else {
+      // Manual mode / Atai Auto: directly use the single set of React state arrays
+      buildConsolidated();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipelineStatus]);
+  // ────────────────────────────────────────────────────────────────────────────
+
   // Handle stopping the current pipeline search
   const handleStopSearch = async () => {
     if (!executionArn) return;
@@ -702,7 +997,6 @@ const Dashboard = () => {
         }
 
         const triggerData = await triggerResponse.json();
-        console.log("\n 0000000000000000", triggerData);
 
         if (!triggerData.success) {
           throw new Error(triggerData.message || 'No data found for this search');
@@ -995,7 +1289,7 @@ const Dashboard = () => {
             const arnToUse = arnOverride !== undefined ? arnOverride : effectiveStageArn;
             if (!arnToUse) return;
 
-            // Fetch Keyword Planner stage results once available
+            // Fetch Keyword Planner stage results — keep retrying each poll until the KWPClean Lambda writes its parquet to S3
             if (!hasLoadedKeywordPlanner) {
               try {
                 const kwpRes = await fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToUse)}`);
@@ -1003,18 +1297,16 @@ const Dashboard = () => {
                   const kwpData = await kwpRes.json();
                   if (kwpData.success && kwpData.available && kwpData.results && kwpData.results.length > 0) {
                     setKeywordPlannerResults(kwpData.results);
+                    if (kwpData.meta !== undefined) setKeywordPlannerMeta(kwpData.meta || null);
+                    setHasLoadedKeywordPlanner(true); // only lock once we actually have rows
                   }
-                  if (kwpData.meta !== undefined) {
-                    setKeywordPlannerMeta(kwpData.meta || null);
-                  }
-                  setHasLoadedKeywordPlanner(true);
                 }
               } catch (e) {
                 console.log("Error fetching Keyword Planner stage results", e);
               }
             }
 
-            // Fetch Google Trends stage results once available
+            // Fetch Google Trends stage results — keep retrying until GoogleTrendsClean writes its parquet
             if (!hasLoadedTrends) {
               try {
                 const trendsRes = await fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToUse)}`);
@@ -1022,51 +1314,43 @@ const Dashboard = () => {
                   const trendsData = await trendsRes.json();
                   if (trendsData.success && trendsData.available && trendsData.results && trendsData.results.length > 0) {
                     setTrendsResults(trendsData.results);
+                    if (trendsData.meta !== undefined) setTrendsMeta(trendsData.meta || null);
+                    setHasLoadedTrends(true); // only lock once we actually have rows
                   }
-                  if (trendsData.meta !== undefined) {
-                    setTrendsMeta(trendsData.meta || null);
-                  }
-                  setHasLoadedTrends(true);
                 }
               } catch (e) {
                 console.log("Error fetching Google Trends stage results", e);
               }
             }
 
-            // Fetch Amazon marketplace stage results if enabled
+            // Fetch Amazon stage results — keep retrying until AmazonClean writes its parquet
             if (amazonFilters && !hasLoadedAmazon) {
               try {
                 const amzRes = await fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToUse)}`);
                 if (amzRes.ok) {
                   const amzData = await amzRes.json();
-                  console.log("Amazon marketplace stage response:", amzData);
                   if (amzData.success && amzData.available && amzData.results && amzData.results.length > 0) {
                     setAmazonResults(amzData.results);
+                    if (amzData.meta !== undefined) setAmazonMeta(amzData.meta || null);
+                    setHasLoadedAmazon(true); // only lock once we actually have rows
                   }
-                  if (amzData.meta !== undefined) {
-                    setAmazonMeta(amzData.meta || null);
-                  }
-                  setHasLoadedAmazon(true);
                 }
               } catch (e) {
                 console.log("Error fetching Amazon marketplace stage results", e);
               }
             }
 
-            // Fetch Alibaba marketplace stage results if enabled
+            // Fetch Alibaba stage results — keep retrying until AlibabaClean writes its parquet
             if (alibabaFilters && !hasLoadedAlibaba) {
               try {
                 const aliRes = await fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToUse)}`);
                 if (aliRes.ok) {
                   const aliData = await aliRes.json();
-                  console.log("Alibaba marketplace stage response:", aliData);
                   if (aliData.success && aliData.available && aliData.results && aliData.results.length > 0) {
                     setAlibabaResults(aliData.results);
+                    if (aliData.meta !== undefined) setAlibabaMeta(aliData.meta || null);
+                    setHasLoadedAlibaba(true); // only lock once we actually have rows
                   }
-                  if (aliData.meta !== undefined) {
-                    setAlibabaMeta(aliData.meta || null);
-                  }
-                  setHasLoadedAlibaba(true);
                 }
               } catch (e) {
                 console.log("Error fetching Alibaba marketplace stage results", e);
@@ -1112,27 +1396,8 @@ const Dashboard = () => {
             // While running, keep refreshing intermediate stage data
             await fetchMarketplaceStages();
 
-            // Preliminary consolidated data fetching disabled for now while debugging marketplace stages
-            // try {
-            //   const queryParams = new URLSearchParams();
-            //   const mode = searchModeMap[searchingMode] || 'manual_search';
-            //   queryParams.append('search_mode', mode);
-            //
-            //   if (mode === 'category_search') {
-            //     queryParams.append('category', productCategory);
-            //   } else if (keywordSearch) {
-            //     queryParams.append('keyword', keywordSearch);
-            //   }
-            //
-            //   const prelimRes = await fetch(`/api/pipeline/preliminary?${queryParams.toString()}`);
-            //   const prelimData = await prelimRes.json();
-            //   if (prelimData.results && prelimData.results.length > 0) {
-            //     setProducts(prelimData.results);
-            //     setIsPreliminary(true);
-            //   }
-            // } catch (e) {
-            //   console.log("Error fetching preliminary data", e);
-            // }
+            // Preliminary consolidated fetch disabled — stage tables (KWP, Trends, Amazon, Alibaba)
+            // appear progressively as each Lambda clean step completes (see fetchMarketplaceStages above).
           }
 
         } catch (e) {
@@ -1292,30 +1557,9 @@ const Dashboard = () => {
                     onChange={(e) => setProductCategory(e.target.value)}
                     className="w-full px-3 py-2 text-black bg-white border border-gray-300 focus:outline-none focus:border-blue-500"
                   >
-                    <option value="All categories">All categories</option>
-                    <option value="Arts & Entertainment">Arts & Entertainment</option>
-                    <option value="Autos & Vehicles">Autos & Vehicles</option>
-                    <option value="Beauty & Fitness">Beauty & Fitness</option>
-                    <option value="Books & Literature">Books & Literature</option>
-                    <option value="Business & Industrial">Business & Industrial</option>
-                    <option value="Computers & Electronics">Computers & Electronics</option>
-                    <option value="Finance">Finance</option>
-                    <option value="Food & Drink">Food & Drink</option>
-                    <option value="Games">Games</option>
-                    <option value="Health">Health</option>
-                    <option value="Hobbies & Leisure">Hobbies & Leisure</option>
-                    <option value="Home & Garden">Home & Garden</option>
-                    <option value="Internet & Telecom">Internet & Telecom</option>
-                    <option value="Jobs & Education">Jobs & Education</option>
-                    <option value="Law & Government">Law & Government</option>
-                    <option value="News">News</option>
-                    <option value="People & Society">People & Society</option>
-                    <option value="Pets & Animals">Pets & Animals</option>
-                    <option value="Real Estate">Real Estate</option>
-                    <option value="Science">Science</option>
-                    <option value="Shopping">Shopping</option>
-                    <option value="Sports">Sports</option>
-                    <option value="Travel">Travel</option>
+                    {GT_CATEGORIES.map((cat) => (
+                      <option key={cat.id} value={cat.name}>{cat.name}</option>
+                    ))}
                   </select>
                 </div>
               )}
@@ -1823,11 +2067,10 @@ const Dashboard = () => {
           <button
             onClick={handleExportCsv}
             disabled={pipelineStatus !== 'COMPLETED'}
-            className={`px-8 py-2 rounded font-bold transition-colors ${
-              pipelineStatus === 'COMPLETED'
-                ? 'bg-blue-500 text-black hover:bg-blue-400'
-                : 'bg-gray-600 text-gray-300 cursor-not-allowed'
-            }`}
+            className={`px-8 py-2 rounded font-bold transition-colors ${pipelineStatus === 'COMPLETED'
+              ? 'bg-blue-500 text-black hover:bg-blue-400'
+              : 'bg-gray-600 text-gray-300 cursor-not-allowed'
+              }`}
           >
             EXPORT CSV
           </button>
@@ -1852,297 +2095,454 @@ const Dashboard = () => {
         {/* Products Results Table */}
         {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE' || hasPerformedSearch) && (
           <div className="mt-8">
+            {/* Preliminary results banner - shown while pipeline is still running and we have partial data */}
+            {isPreliminary && pipelineStatus === 'POLLING' && products.length > 0 && (
+              <div className="mb-4 px-4 py-3 bg-yellow-500/20 border border-yellow-400/50 rounded flex items-center gap-3">
+                <span className="w-2.5 h-2.5 rounded-full bg-yellow-400 flex-shrink-0 animate-pulse" />
+                <p className="text-yellow-300 text-sm font-semibold tracking-wide">
+                  PRELIMINARY / PROCESSING — Pipeline still running. These are partial results from the previous consolidated dataset and will update automatically once the pipeline completes.
+                </p>
+              </div>
+            )}
+
+            {/* ── CONSOLIDATED RESULTS TABLE – shown as soon as pipeline COMPLETES ── */}
+            {pipelineStatus === 'COMPLETED' && consolidatedResults.length > 0 && (
+              <div className="mt-6 mb-10">
+                {/* Header */}
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5 border-b border-[#C0FE72]/30 pb-4">
+                  <div>
+                    <h2 className="text-2xl font-bold text-[#C0FE72] tracking-wider">CONSOLIDATED RESULTS</h2>
+                    <p className="text-xs text-gray-400 mt-1">Merged from all pipeline stages · Scored &amp; ranked in-browser</p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="inline-flex items-center gap-2 px-3 py-1 bg-green-500/20 border border-green-400/40 rounded text-green-300 text-xs font-bold">
+                      <span className="w-2 h-2 rounded-full bg-green-400" />
+                      SUCCEEDED
+                    </span>
+                    <span className="text-sm text-gray-300">{consolidatedResults.length} rows</span>
+                  </div>
+                </div>
+
+                {/* Score legend */}
+                <div className="flex flex-wrap gap-4 mb-4 text-xs text-gray-400">
+                  <span><strong className="text-[#C0FE72]">Demand</strong> 35% · Avg monthly searches (KWP)</span>
+                  <span><strong className="text-[#C0FE72]">Trend</strong> 30% · Google Trends peak interest</span>
+                  <span><strong className="text-[#C0FE72]">Competition</strong> 15% · Inverse of Amazon review count</span>
+                  <span><strong className="text-[#C0FE72]">Supplier</strong> 10% · Alibaba rating + low MOQ</span>
+                  <span><strong className="text-[#C0FE72]">Price</strong> 10% · Amazon price relative to others</span>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full border-separate border-spacing-0 border border-white/20 bg-[#2a3627] text-sm">
+                    <thead>
+                      {/* Source group headers */}
+                      <tr className="bg-[#1a2418] text-[#C0FE72] text-[10px] uppercase tracking-widest">
+                        <th className="px-3 py-1 text-center border-r border-white/10">#</th>
+                        <th colSpan={4} className="px-3 py-1 text-center border-r border-white/10">📋 Keyword Planner</th>
+                        <th colSpan={4} className="px-3 py-1 text-center border-r border-white/10">📈 Google Trends</th>
+                        <th colSpan={5} className="px-3 py-1 text-center border-r border-white/10">🛒 Amazon</th>
+                        <th colSpan={4} className="px-3 py-1 text-center border-r border-white/10">🏭 Alibaba</th>
+                        <th colSpan={6} className="px-3 py-1 text-center">🏆 Scores</th>
+                      </tr>
+                      {/* Column names */}
+                      <tr className="bg-[#C0FE72] text-black">
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase border-r border-black/20">Rank</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Keyword</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Avg Monthly Searches</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">CPC (USD)</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase border-r border-black/20">KWP Trend</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">GT Peak</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">GT Avg</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">GT Direction</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase border-r border-black/20">GT Change %</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Product Title</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Price (USD)</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Reviews</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Rating</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase border-r border-black/20">BSR</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Supplier Product</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">MOQ</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Sup. Rating</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase border-r border-black/20">Country</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Demand</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Trend</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Compet.</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Supplier</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Price</th>
+                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Final Score</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {consolidatedResults.map((row, idx) => {
+                        const scoreColor = (s: number) =>
+                          s >= 70 ? 'text-green-400' : s >= 40 ? 'text-yellow-300' : 'text-red-400';
+                        const fmtNum = (v: any, prefix = '', suffix = '', decimals = 0) =>
+                          v !== null && v !== undefined && v !== '-' && Number(v) !== 0
+                            ? `${prefix}${Number(v).toFixed(decimals)}${suffix}` : '-';
+                        const str = (v: any) => (v && v !== '-' ? String(v) : '-');
+                        return (
+                          <tr key={idx} className={`border-b border-white/5 hover:bg-white/5 transition-colors ${idx % 2 !== 0 ? 'bg-black/10' : ''}`}>
+                            {/* Rank */}
+                            <td className="px-3 py-2 font-bold text-[#C0FE72] whitespace-nowrap border-r border-white/10">{row.rank}</td>
+                            {/* KWP */}
+                            <td className="px-3 py-2 font-semibold text-white whitespace-nowrap">{toTitleCase(row.keyword)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{row.avg_monthly_searches ? Number(row.avg_monthly_searches).toLocaleString() : '-'}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.cpc_usd, '$', '', 2)}</td>
+                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap capitalize border-r border-white/10">{str(row.kwp_trend_direction)}</td>
+                            {/* Google Trends */}
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.trend_peak)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.trend_avg, '', '', 1)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap capitalize">{str(row.gt_interest_trend)}</td>
+                            <td className="px-3 py-2 whitespace-nowrap border-r border-white/10">
+                              {row.gt_interest_change_pct !== null && row.gt_interest_change_pct !== undefined
+                                ? <span className={Number(row.gt_interest_change_pct) >= 0 ? 'text-green-400' : 'text-red-400'}>
+                                  {Number(row.gt_interest_change_pct) >= 0 ? '+' : ''}{Number(row.gt_interest_change_pct).toFixed(1)}%
+                                </span>
+                                : '-'}
+                            </td>
+                            {/* Amazon */}
+                            <td className="px-3 py-2 text-gray-200 max-w-[220px] truncate" title={row.amazon_title}>{str(row.amazon_title)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.amazon_price_usd, '$', '', 2)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{row.reviews_count ? Number(row.reviews_count).toLocaleString() : '-'}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.rating, '', '★', 1)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap border-r border-white/10">{str(row.bestseller_rank)}</td>
+                            {/* Alibaba */}
+                            <td className="px-3 py-2 text-gray-200 max-w-[180px] truncate" title={row.alibaba_title}>{str(row.alibaba_title)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{row.moq ? Number(row.moq).toLocaleString() : '-'}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.supplier_rating, '', '★', 1)}</td>
+                            <td className="px-3 py-2 text-gray-100 whitespace-nowrap border-r border-white/10">{str(row.supplier_country)}</td>
+                            {/* Scores */}
+                            <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.demand_score)}`}>{row.demand_score}</td>
+                            <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.trend_score)}`}>{row.trend_score}</td>
+                            <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.competition_score)}`}>{row.competition_score}</td>
+                            <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.supplier_score)}`}>{row.supplier_score}</td>
+                            <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.price_score)}`}>{row.price_score}</td>
+                            {/* Final score with progress bar */}
+                            <td className="px-3 py-2 whitespace-nowrap">
+                              <div className="flex items-center gap-2">
+                                <div className="w-14 h-2 bg-white/10 rounded-full overflow-hidden">
+                                  <div
+                                    className={`h-full rounded-full ${row.final_score >= 70 ? 'bg-green-400' : row.final_score >= 40 ? 'bg-yellow-400' : 'bg-red-400'}`}
+                                    style={{ width: `${row.final_score}%` }}
+                                  />
+                                </div>
+                                <span className={`font-bold text-sm ${scoreColor(row.final_score)}`}>{row.final_score}</span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ── NO DATA PASSED FILTERS – empty state after pipeline completes ── */}
+            {pipelineStatus === 'COMPLETED' && consolidatedResults.length === 0 && hasLoadedKeywordPlanner && (
+              <div className="mt-6 mb-10 p-6 bg-[#2a3627] rounded border border-orange-400/40 text-center">
+                <div className="text-4xl mb-3">🔍</div>
+                <p className="text-lg font-bold text-orange-300 mb-2">No data passed the current filters</p>
+                <p className="text-sm text-gray-400 max-w-lg mx-auto">
+                  The pipeline completed but no keywords survived the Keyword Planner stage — likely because your search volume minimum, Google Trends score, or other filters are too strict.
+                </p>
+                <p className="text-sm text-gray-400 mt-3">
+                  Try <strong className="text-white">relaxing your filters</strong> (lower the search volume min, reduce Google Trend score threshold, or disable Amazon / Alibaba filters) and run the search again.
+                </p>
+              </div>
+            )}
+
             {/* Stage-level details (audit-only views) - always visible while pipeline is active */}
             {activeSearch && pipelineStatus !== 'IDLE' && (
               <div className="mb-10">
-                    {/* Category: keywords from Google Trends - show first */}
-                    {searchingMode === 'CATEGORY BASED' && categoryKeywordsPreview !== null && categoryKeywordsPreview.length > 0 && (
-                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/30">
-                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider mb-2">KEYWORDS FROM GOOGLE TRENDS</h3>
-                        <p className="text-sm text-gray-400 mb-4">Keywords generated for this category; one Step Function execution runs per keyword.</p>
-                        <div className="flex flex-wrap gap-2">
-                          {categoryKeywordsPreview.map((kw, idx) => (
-                            <span
-                              key={idx}
-                              className="px-3 py-1.5 bg-[#32402F] text-gray-100 rounded border border-white/20 text-sm"
-                            >
-                              {kw}
-                            </span>
+                {/* Category: keywords from Google Trends - show first */}
+                {searchingMode === 'CATEGORY BASED' && categoryKeywordsPreview !== null && categoryKeywordsPreview.length > 0 && (
+                  <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/30">
+                    <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider mb-2">KEYWORDS FROM GOOGLE TRENDS</h3>
+                    <p className="text-sm text-gray-400 mb-4">Keywords generated for this category; one Step Function execution runs per keyword.</p>
+                    <div className="flex flex-wrap gap-2">
+                      {categoryKeywordsPreview.map((kw, idx) => (
+                        <span
+                          key={idx}
+                          className="px-3 py-1.5 bg-[#32402F] text-gray-100 rounded border border-white/20 text-sm"
+                        >
+                          {kw}
+                        </span>
+                      ))}
+                    </div>
+                    <p className="text-xs text-gray-500 mt-4">Total: {categoryKeywordsPreview.length} keyword(s)</p>
+                  </div>
+                )}
+
+                {/* Category Pipeline Tracker - show second (above stage results) */}
+                {searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && (
+                  <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                    <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
+                      <div>
+                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">CATEGORY PIPELINE TRACKER</h3>
+                        <div className="text-xs text-gray-400">Each variant keyword runs its own pipeline.</div>
+                      </div>
+                      <div className="flex flex-col md:flex-row md:items-center gap-2">
+                        <span className="text-xs font-semibold text-gray-200 uppercase tracking-wide">Variant View</span>
+                        <select
+                          value={selectedCategoryVariant}
+                          onChange={(e) => handleCategoryVariantChange(e.target.value)}
+                          className="px-3 py-1 text-xs bg-[#32402F] text-white border border-white/40 rounded focus:outline-none focus:border-[#C0FE72]"
+                        >
+                          <option value="ALL">Select a variant</option>
+                          {categoryExecutions.map((exec) => (
+                            <option key={exec.keyword} value={exec.keyword}>
+                              {exec.keyword}
+                            </option>
                           ))}
-                        </div>
-                        <p className="text-xs text-gray-500 mt-4">Total: {categoryKeywordsPreview.length} keyword(s)</p>
+                        </select>
                       </div>
-                    )}
-
-                    {/* Category Pipeline Tracker - show second (above stage results) */}
-                    {searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && (
-                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
-                        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
-                          <div>
-                            <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">CATEGORY PIPELINE TRACKER</h3>
-                            <div className="text-xs text-gray-400">Each variant keyword runs its own pipeline.</div>
-                          </div>
-                          <div className="flex flex-col md:flex-row md:items-center gap-2">
-                            <span className="text-xs font-semibold text-gray-200 uppercase tracking-wide">Variant View</span>
-                            <select
-                              value={selectedCategoryVariant}
-                              onChange={(e) => handleCategoryVariantChange(e.target.value)}
-                              className="px-3 py-1 text-xs bg-[#32402F] text-white border border-white/40 rounded focus:outline-none focus:border-[#C0FE72]"
-                            >
-                              <option value="ALL">Select a variant</option>
-                              {categoryExecutions.map((exec) => (
-                                <option key={exec.keyword} value={exec.keyword}>
-                                  {exec.keyword}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        </div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm text-left border-collapse">
-                            <thead>
-                              <tr className="border-b border-white/30 text-gray-300">
-                                <th className="pb-3 pr-4 font-semibold uppercase tracking-wider">Target Keyword</th>
-                                <th className="pb-3 px-4 font-semibold uppercase tracking-wider">Execution Status</th>
-                                <th className="pb-3 pl-4 font-semibold uppercase tracking-wider">Run ID / ARN</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {categoryExecutions.map((exec, idx) => (
-                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                  <td className="py-4 pr-4 font-medium text-white">{exec.keyword}</td>
-                                  <td className="py-4 px-4">
-                                    <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold tracking-tight shadow-sm ${exec.status === 'SUCCEEDED' ? 'bg-green-500/20 text-green-400 border border-green-500/30' :
-                                      exec.status === 'FAILED' ? 'bg-red-500/20 text-red-400 border border-red-500/30' :
-                                        exec.status === 'RUNNING' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse' :
-                                          'bg-gray-500/20 text-gray-400 border border-gray-500/30'
-                                      }`}>
-                                      <span className={`w-2 h-2 rounded-full mr-2 ${exec.status === 'SUCCEEDED' ? 'bg-green-400' :
-                                        exec.status === 'FAILED' ? 'bg-red-400' :
-                                          exec.status === 'RUNNING' ? 'bg-blue-400' :
-                                            'bg-gray-400'
-                                        }`}></span>
-                                      {exec.status || 'INITIALIZING'}
-                                    </span>
-                                  </td>
-                                  <td className="py-4 pl-4 font-mono text-[10px] text-gray-500 break-all max-w-xs">{exec.run_id || exec.execution_arn}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Stage results - below Category Pipeline Tracker; per selected variant only (no merge) */}
-                    {searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && selectedCategoryVariant !== 'ALL' && (
-                      <div className="mb-6 p-3 bg-[#32402F] rounded border border-[#C0FE72]/20">
-                        <p className="text-sm text-gray-300">
-                          Showing data for variant: <strong className="text-[#C0FE72]">{selectedCategoryVariant}</strong>
-                        </p>
-                      </div>
-                    )}
-                    {/* Category mode: selected variant produced no surviving stage data (all variants filtered out).
-                        Only show after Keyword Planner + Trends stages have both completed and returned no rows. */}
-                    {searchingMode === 'CATEGORY BASED' &&
-                      categoryExecutions.length > 0 &&
-                      selectedCategoryVariant !== 'ALL' &&
-                      pipelineStatus === 'COMPLETED' &&
-                      hasLoadedKeywordPlanner &&
-                      hasLoadedTrends &&
-                      !keywordPlannerResults?.length &&
-                      !trendsResults?.length && (
-                        <div className="mb-6 p-4 bg-[#2a3627] rounded border border-red-400/40 text-center">
-                          <p className="text-sm text-gray-100 font-semibold">
-                            All candidate variants for this keyword were removed by the pipeline filters, so no stage files were written.
-                          </p>
-                          <p className="mt-2 text-xs text-gray-400">
-                            Try relaxing your filters (search volume, Google Trends score, marketplace filters) or choose another variant from the{' '}
-                            <strong className="text-[#C0FE72]">Variant View</strong> dropdown above.
-                          </p>
-                        </div>
-                      )}
-                    {/* Category mode: prompt to select a keyword to view stage data */}
-                    {searchingMode === 'CATEGORY BASED' && selectedCategoryVariant === 'ALL' && categoryExecutions.length > 0 && !keywordPlannerResults?.length && !trendsResults?.length && (
-                      <div className="mb-6 p-4 bg-[#2a3627] rounded border border-white/20 text-center">
-                        <p className="text-gray-300 text-sm">
-                          Select a keyword from the <strong className="text-[#C0FE72]">Variant View</strong> dropdown above to view <strong>Keyword Planner</strong>, <strong>Google Trends</strong>, <strong>Amazon</strong>, and <strong>Alibaba</strong> stage data for that keyword only.
-                        </p>
-                      </div>
-                    )}
-                    {/* Keyword Planner Stage Summary */}
-                    {(() => {
-                      const displayRows = filterStageRowsByVariant(keywordPlannerResults, ['root_keyword', 'sub_keyword', 'keyword'], 'root_keyword');
-                      if (!displayRows || displayRows.length === 0) return null;
-                      return (
-                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
-                        <div className="flex justify-between items-center mb-4">
-                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">KEYWORD PLANNER STAGE</h3>
-                          <div className="text-sm text-gray-300">
-                            {keywordPlannerMeta?.message || 'Keyword Planner Parquet created'} · Rows: {keywordPlannerMeta?.rows ?? displayRows.length}
-                          </div>
-                        </div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm text-left border-collapse">
-                            <thead>
-                              <tr className="border-b border-white/30 text-gray-300">
-                                {Object.keys(displayRows[0]).map((col) => (
-                                  <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                    {col.replace(/_/g, ' ')}
-                                  </th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {displayRows.map((row, idx) => (
-                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                  {Object.keys(displayRows[0]).map((col) => (
-                                    <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
-                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                        ? String((row as any)[col])
-                                        : '-'}
-                                    </td>
-                                  ))}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                      );
-                    })()}
-
-                    {/* Google Trends Stage Summary */}
-                    {(() => {
-                      const displayRows = filterStageRowsByVariant(trendsResults, ['keyword'], 'keyword');
-                      if (!displayRows || displayRows.length === 0) return null;
-                      return (
-                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
-                        <div className="flex justify-between items-center mb-4">
-                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">GOOGLE TRENDS STAGE</h3>
-                          <div className="text-sm text-gray-300">
-                            {trendsMeta?.message || 'Google Trends Parquet created successfully'} · Rows: {trendsMeta?.rows ?? displayRows.length}
-                          </div>
-                        </div>
+                    </div>
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm text-left border-collapse">
                         <thead>
                           <tr className="border-b border-white/30 text-gray-300">
-                            {Object.keys(displayRows[0]).map((col) => (
-                              <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                {col === 'score_value' ? 'FCL' : col.replace(/_/g, ' ')}
-                              </th>
-                            ))}
+                            <th className="pb-3 pr-4 font-semibold uppercase tracking-wider">Target Keyword</th>
+                            <th className="pb-3 px-4 font-semibold uppercase tracking-wider">Execution Status</th>
+                            <th className="pb-3 pl-4 font-semibold uppercase tracking-wider">Run ID / ARN</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {displayRows.map((row, idx) => (
+                          {categoryExecutions.map((exec, idx) => (
                             <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                              {Object.keys(displayRows[0]).map((col) => (
-                                <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
-                                  {(() => {
-                                    const value = (row as any)[col];
-                                    if (value === undefined || value === null) return '-';
-                                    if (col === 'score_value') {
-                                      const num = Number(value);
-                                      return Number.isFinite(num) ? `${num.toFixed(2)}` : String(value);
-                                    }
-                                    return String(value);
-                                  })()}
-                                </td>
-                              ))}
+                              <td className="py-4 pr-4 font-medium text-white">{exec.keyword}</td>
+                              <td className="py-4 px-4">
+                                <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-bold tracking-tight shadow-sm ${exec.status === 'SUCCEEDED' ? 'bg-green-500/20 text-green-400 border border-green-500/30' :
+                                  exec.status === 'FAILED' ? 'bg-red-500/20 text-red-400 border border-red-500/30' :
+                                    exec.status === 'RUNNING' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse' :
+                                      'bg-gray-500/20 text-gray-400 border border-gray-500/30'
+                                  }`}>
+                                  <span className={`w-2 h-2 rounded-full mr-2 ${exec.status === 'SUCCEEDED' ? 'bg-green-400' :
+                                    exec.status === 'FAILED' ? 'bg-red-400' :
+                                      exec.status === 'RUNNING' ? 'bg-blue-400' :
+                                        'bg-gray-400'
+                                    }`}></span>
+                                  {exec.status || 'INITIALIZING'}
+                                </span>
+                              </td>
+                              <td className="py-4 pl-4 font-mono text-[10px] text-gray-500 break-all max-w-xs">{exec.run_id || exec.execution_arn}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     </div>
-                      </div>
-                      );
-                    })()}
+                  </div>
+                )}
 
-                    {/* Amazon Marketplace Stage */}
-                    {(() => {
-                      const displayRows = filterStageRowsByVariant(amazonResults, ['keyword', 'search_category'], 'keyword');
-                      if (!displayRows || displayRows.length === 0) return null;
-                      return (
-                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
-                        <div className="flex justify-between items-center mb-4">
-                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">AMAZON MARKETPLACE STAGE</h3>
-                          <div className="text-sm text-gray-300">
-                            {amazonMeta?.message || 'Amazon raw cleaned + converted to parquet'} · Rows: {amazonMeta?.rows ?? displayRows.length}
-                          </div>
+                {/* Stage results - below Category Pipeline Tracker; per selected variant only (no merge) */}
+                {searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0 && selectedCategoryVariant !== 'ALL' && (
+                  <div className="mb-6 p-3 bg-[#32402F] rounded border border-[#C0FE72]/20">
+                    <p className="text-sm text-gray-300">
+                      Showing data for variant: <strong className="text-[#C0FE72]">{selectedCategoryVariant}</strong>
+                    </p>
+                  </div>
+                )}
+                {/* Category mode: selected variant produced no surviving stage data (all variants filtered out).
+                        Only show after Keyword Planner + Trends stages have both completed and returned no rows. */}
+                {searchingMode === 'CATEGORY BASED' &&
+                  categoryExecutions.length > 0 &&
+                  selectedCategoryVariant !== 'ALL' &&
+                  pipelineStatus === 'COMPLETED' &&
+                  hasLoadedKeywordPlanner &&
+                  hasLoadedTrends &&
+                  !keywordPlannerResults?.length &&
+                  !trendsResults?.length && (
+                    <div className="mb-6 p-4 bg-[#2a3627] rounded border border-red-400/40 text-center">
+                      <p className="text-sm text-gray-100 font-semibold">
+                        All candidate variants for this keyword were removed by the pipeline filters, so no stage files were written.
+                      </p>
+                      <p className="mt-2 text-xs text-gray-400">
+                        Try relaxing your filters (search volume, Google Trends score, marketplace filters) or choose another variant from the{' '}
+                        <strong className="text-[#C0FE72]">Variant View</strong> dropdown above.
+                      </p>
+                    </div>
+                  )}
+                {/* Category mode: prompt to select a keyword to view stage data */}
+                {searchingMode === 'CATEGORY BASED' && selectedCategoryVariant === 'ALL' && categoryExecutions.length > 0 && !keywordPlannerResults?.length && !trendsResults?.length && (
+                  <div className="mb-6 p-4 bg-[#2a3627] rounded border border-white/20 text-center">
+                    <p className="text-gray-300 text-sm">
+                      Select a keyword from the <strong className="text-[#C0FE72]">Variant View</strong> dropdown above to view <strong>Keyword Planner</strong>, <strong>Google Trends</strong>, <strong>Amazon</strong>, and <strong>Alibaba</strong> stage data for that keyword only.
+                    </p>
+                  </div>
+                )}
+                {/* Keyword Planner Stage Summary */}
+                {(() => {
+                  const displayRows = filterStageRowsByVariant(keywordPlannerResults, ['root_keyword', 'sub_keyword', 'keyword'], 'root_keyword');
+                  if (!displayRows || displayRows.length === 0) return null;
+                  return (
+                    <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                      <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">KEYWORD PLANNER STAGE</h3>
+                        <div className="text-sm text-gray-300">
+                          {keywordPlannerMeta?.message || 'Keyword Planner Parquet created'} · Rows: {keywordPlannerMeta?.rows ?? displayRows.length}
                         </div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm text-left border-collapse">
-                            <thead>
-                              <tr className="border-b border-white/30 text-gray-300">
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-white/30 text-gray-300">
+                              {Object.keys(displayRows[0]).map((col) => (
+                                <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                  {col.replace(/_/g, ' ')}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {displayRows.map((row, idx) => (
+                              <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
                                 {Object.keys(displayRows[0]).map((col) => (
-                                  <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                    {col.replace(/_/g, ' ')}
-                                  </th>
+                                  <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                    {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                      ? String((row as any)[col])
+                                      : '-'}
+                                  </td>
                                 ))}
                               </tr>
-                            </thead>
-                            <tbody>
-                              {displayRows.map((row, idx) => (
-                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                  {Object.keys(displayRows[0]).map((col) => (
-                                    <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
-                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                        ? String((row as any)[col])
-                                        : '-'}
-                                    </td>
-                                  ))}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Google Trends Stage Summary */}
+                {(() => {
+                  const displayRows = filterStageRowsByVariant(trendsResults, ['keyword'], 'keyword');
+                  if (!displayRows || displayRows.length === 0) return null;
+                  return (
+                    <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                      <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">GOOGLE TRENDS STAGE</h3>
+                        <div className="text-sm text-gray-300">
+                          {trendsMeta?.message || 'Google Trends Parquet created successfully'} · Rows: {trendsMeta?.rows ?? displayRows.length}
                         </div>
                       </div>
-                      );
-                    })()}
-
-                    {/* Alibaba Marketplace Stage */}
-                    {(() => {
-                      const displayRows = filterStageRowsByVariant(alibabaResults, ['keyword', 'search_category'], 'keyword');
-                      if (!displayRows || displayRows.length === 0) return null;
-                      return (
-                      <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
-                        <div className="flex justify-between items-center mb-4">
-                          <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">ALIBABA MARKETPLACE STAGE</h3>
-                          <div className="text-sm text-gray-300">
-                            {alibabaMeta?.message || 'Alibaba raw cleaned + converted'} · Rows: {alibabaMeta?.rows ?? displayRows.length}
-                          </div>
-                        </div>
-                        <div className="overflow-x-auto">
-                          <table className="w-full text-sm text-left border-collapse">
-                            <thead>
-                              <tr className="border-b border-white/30 text-gray-300">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-white/30 text-gray-300">
+                              {Object.keys(displayRows[0]).map((col) => (
+                                <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                  {col === 'score_value' ? 'FCL' : col.replace(/_/g, ' ')}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {displayRows.map((row, idx) => (
+                              <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
                                 {Object.keys(displayRows[0]).map((col) => (
-                                  <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                    {col.replace(/_/g, ' ')}
-                                  </th>
+                                  <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                    {(() => {
+                                      const value = (row as any)[col];
+                                      if (value === undefined || value === null) return '-';
+                                      if (col === 'score_value') {
+                                        const num = Number(value);
+                                        return Number.isFinite(num) ? `${num.toFixed(2)}` : String(value);
+                                      }
+                                      return String(value);
+                                    })()}
+                                  </td>
                                 ))}
                               </tr>
-                            </thead>
-                            <tbody>
-                              {displayRows.map((row, idx) => (
-                                <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                  {Object.keys(displayRows[0]).map((col) => (
-                                    <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
-                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                        ? String((row as any)[col])
-                                        : '-'}
-                                    </td>
-                                  ))}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Amazon Marketplace Stage */}
+                {(() => {
+                  const displayRows = filterStageRowsByVariant(amazonResults, ['keyword', 'search_category'], 'keyword');
+                  if (!displayRows || displayRows.length === 0) return null;
+                  return (
+                    <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                      <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">AMAZON MARKETPLACE STAGE</h3>
+                        <div className="text-sm text-gray-300">
+                          {amazonMeta?.message || 'Amazon raw cleaned + converted to parquet'} · Rows: {amazonMeta?.rows ?? displayRows.length}
                         </div>
                       </div>
-                      );
-                    })()}
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-white/30 text-gray-300">
+                              {Object.keys(displayRows[0]).map((col) => (
+                                <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                  {col.replace(/_/g, ' ')}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {displayRows.map((row, idx) => (
+                              <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                {Object.keys(displayRows[0]).map((col) => (
+                                  <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                    {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                      ? String((row as any)[col])
+                                      : '-'}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Alibaba Marketplace Stage */}
+                {(() => {
+                  const displayRows = filterStageRowsByVariant(alibabaResults, ['keyword', 'search_category'], 'keyword');
+                  if (!displayRows || displayRows.length === 0) return null;
+                  return (
+                    <div className="mb-8 p-6 bg-[#2a3627] rounded shadow-xl border border-white/10">
+                      <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-2xl font-bold text-[#C0FE72] tracking-wider">ALIBABA MARKETPLACE STAGE</h3>
+                        <div className="text-sm text-gray-300">
+                          {alibabaMeta?.message || 'Alibaba raw cleaned + converted'} · Rows: {alibabaMeta?.rows ?? displayRows.length}
+                        </div>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-white/30 text-gray-300">
+                              {Object.keys(displayRows[0]).map((col) => (
+                                <th key={col} className="pb-3 pr-4 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                  {col.replace(/_/g, ' ')}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {displayRows.map((row, idx) => (
+                              <tr key={idx} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                {Object.keys(displayRows[0]).map((col) => (
+                                  <td key={col} className="py-2 pr-4 text-gray-100 whitespace-nowrap">
+                                    {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                      ? String((row as any)[col])
+                                      : '-'}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
@@ -2187,573 +2587,588 @@ const Dashboard = () => {
               </div>
             )}
 
-            {searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'COMPLETED' && (
-              <>
-                <div className="flex justify-between items-center mb-4">
-                  <div className="text-xl font-bold text-white">
-                    Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+
+
+            {/* Legacy S3-ranked table (disabled) kept only as reference */}
+
+            {/* Legacy S3-ranked table kept for IDLE mode (Active Search OFF results) */}
+            {
+              searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'COMPLETED' && false && (
+                <>
+                  <div className="flex justify-between items-center mb-4">
+                    <div className="text-xl font-bold text-white">
+                      Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                    </div>
+                    <div className="text-center">
+                      <p className={`${isPreliminary ? 'text-yellow-500' : 'text-green-600'} text-4xl font-bold mb-2`}>
+                        {isPreliminary ? 'PRELIMINARY / PROCESSING' : 'SUCCEEDED'}
+                      </p>
+                    </div>
+                    <div className="w-48"></div> {/* Spacer for symmetry */}
                   </div>
-                  <div className="text-center">
-                    <p className={`${isPreliminary ? 'text-yellow-500' : 'text-green-600'} text-4xl font-bold mb-2`}>
-                      {isPreliminary ? 'PRELIMINARY / PROCESSING' : 'SUCCEEDED'}
-                    </p>
-                  </div>
-                  <div className="w-48"></div> {/* Spacer for symmetry */}
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
-                    <thead>
-                      <tr className="bg-yellow-500 text-black">
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
-                          style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                        >
-                          Global ID
-                        </th>
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                          style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                        >
-                          Keyword
-                        </th>
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                          style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                        >
-                          Title
-                        </th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {products.map((product, index) => {
-                        const rowId = String(product.global_id || product.product_id || `${product.keyword || 'kw'}-${index}`);
-                        const isExpanded = expandedProductId === rowId;
-                        const kw = (product.keyword || '').toString().toLowerCase();
-
-                        const filterByKeyword = (rows: any[] | null | undefined, fields: string[]): any[] => {
-                          if (!rows || !kw) return [];
-                          return rows.filter((row) => {
-                            const text = fields
-                              .map((f) => ((row as any)[f] ?? '').toString().toLowerCase())
-                              .join(' ');
-                            return text.includes(kw);
-                          });
-                        };
-
-                        const kwpRows = filterByKeyword(keywordPlannerResults, ['keyword', 'sub_keyword', 'root_keyword']);
-                        const trendsRows = filterByKeyword(trendsResults, ['keyword']);
-                        const amzRows = filterByKeyword(amazonResults, ['keyword', 'search_category']);
-                        const aliRows = filterByKeyword(alibabaResults, ['keyword', 'search_category']);
-
-                        return (
-                          <React.Fragment key={rowId}>
-                            <tr
-                              className="group hover:bg-[#3d4d3a] transition-colors"
-                            >
-                          <td
-                            className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
+                      <thead>
+                        <tr className="bg-yellow-500 text-black">
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
                             style={{ minWidth: '120px', borderRight: '2px solid white' }}
                           >
-                            {product.global_id || '-'}
-                          </td>
-                          <td
-                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            Global ID
+                          </th>
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
                             style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
                           >
-                            {product.keyword ? toTitleCase(product.keyword) : '-'}
-                          </td>
-                          <td
-                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                            Keyword
+                          </th>
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
                             style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
                           >
-                            {product.title || '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
-                          </td>
-                              <td className="border border-white px-3 py-2">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setExpandedProductId((current) => (current === rowId ? null : rowId));
-                                  }}
-                                  className="px-3 py-1 text-xs font-semibold rounded bg-white text-black hover:bg-gray-200 transition-colors"
+                            Title
+                          </th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Specs</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {products.map((product, index) => {
+                          const rowId = String(product.global_id || product.product_id || `${product.keyword || 'kw'}-${index}`);
+                          const isExpanded = expandedProductId === rowId;
+                          const kw = (product.keyword || '').toString().toLowerCase();
+
+                          const filterByKeyword = (rows: any[] | null | undefined, fields: string[]): any[] => {
+                            if (!rows || !kw) return [];
+                            return rows.filter((row) => {
+                              const text = fields
+                                .map((f) => ((row as any)[f] ?? '').toString().toLowerCase())
+                                .join(' ');
+                              return text.includes(kw);
+                            });
+                          };
+
+                          const kwpRows = filterByKeyword(keywordPlannerResults, ['keyword', 'sub_keyword', 'root_keyword']);
+                          const trendsRows = filterByKeyword(trendsResults, ['keyword']);
+                          const amzRows = filterByKeyword(amazonResults, ['keyword', 'search_category']);
+                          const aliRows = filterByKeyword(alibabaResults, ['keyword', 'search_category']);
+
+                          return (
+                            <React.Fragment key={rowId}>
+                              <tr
+                                className="group hover:bg-[#3d4d3a] transition-colors"
+                              >
+                                <td
+                                  className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                                  style={{ minWidth: '120px', borderRight: '2px solid white' }}
                                 >
-                                  {isExpanded ? 'Hide specs' : 'Specs'}
-                                </button>
-                              </td>
-                            </tr>
-                            {isExpanded && (
-                              <tr className="bg-[#25301f]">
-                                <td colSpan={16} className="border-t border-white/20 px-3 py-3">
-                                  <div className="space-y-4">
-                                    {/* Keyword Planner specs */}
-                                    {kwpRows.length > 0 && (
-                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
-                                        <div className="flex justify-between items-center mb-2">
-                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Keyword Planner details</h4>
-                                          <div className="text-[10px] text-gray-300">
-                                            Rows: {kwpRows.length}
-                                          </div>
-                                        </div>
-                                        <div className="overflow-x-auto">
-                                          <table className="w-full text-[11px] text-left border-collapse">
-                                            <thead>
-                                              <tr className="border-b border-white/30 text-gray-300">
-                                                {Object.keys(kwpRows[0]).map((col) => (
-                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                                    {col.replace(/_/g, ' ')}
-                                                  </th>
-                                                ))}
-                                              </tr>
-                                            </thead>
-                                            <tbody>
-                                              {kwpRows.map((row, idx2) => (
-                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                                  {Object.keys(kwpRows[0]).map((col) => (
-                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
-                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                                        ? String((row as any)[col])
-                                                        : '-'}
-                                                    </td>
-                                                  ))}
-                                                </tr>
-                                              ))}
-                                            </tbody>
-                                          </table>
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    {/* Google Trends specs */}
-                                    {trendsRows.length > 0 && (
-                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
-                                        <div className="flex justify-between items-center mb-2">
-                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Google Trends details</h4>
-                                          <div className="text-[10px] text-gray-300">
-                                            Rows: {trendsRows.length}
-                                          </div>
-                                        </div>
-                                        <div className="overflow-x-auto">
-                                          <table className="w-full text-[11px] text-left border-collapse">
-                                            <thead>
-                                              <tr className="border-b border-white/30 text-gray-300">
-                                                {Object.keys(trendsRows[0]).map((col) => (
-                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                                    {col.replace(/_/g, ' ')}
-                                                  </th>
-                                                ))}
-                                              </tr>
-                                            </thead>
-                                            <tbody>
-                                              {trendsRows.map((row, idx2) => (
-                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                                  {Object.keys(trendsRows[0]).map((col) => (
-                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
-                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                                        ? String((row as any)[col])
-                                                        : '-'}
-                                                    </td>
-                                                  ))}
-                                                </tr>
-                                              ))}
-                                            </tbody>
-                                          </table>
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    {/* Amazon specs */}
-                                    {amzRows.length > 0 && (
-                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
-                                        <div className="flex justify-between items-center mb-2">
-                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Amazon marketplace details</h4>
-                                          <div className="text-[10px] text-gray-300">
-                                            Rows: {amzRows.length}
-                                          </div>
-                                        </div>
-                                        <div className="overflow-x-auto">
-                                          <table className="w-full text-[11px] text-left border-collapse">
-                                            <thead>
-                                              <tr className="border-b border-white/30 text-gray-300">
-                                                {Object.keys(amzRows[0]).map((col) => (
-                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                                    {col.replace(/_/g, ' ')}
-                                                  </th>
-                                                ))}
-                                              </tr>
-                                            </thead>
-                                            <tbody>
-                                              {amzRows.map((row, idx2) => (
-                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                                  {Object.keys(amzRows[0]).map((col) => (
-                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
-                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                                        ? String((row as any)[col])
-                                                        : '-'}
-                                                    </td>
-                                                  ))}
-                                                </tr>
-                                              ))}
-                                            </tbody>
-                                          </table>
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    {/* Alibaba specs */}
-                                    {aliRows.length > 0 && (
-                                      <div className="p-3 bg-[#2a3627] rounded border border-white/10">
-                                        <div className="flex justify-between items-center mb-2">
-                                          <h4 className="text-sm font-semibold text-[#C0FE72]">Alibaba supplier details</h4>
-                                          <div className="text-[10px] text-gray-300">
-                                            Rows: {aliRows.length}
-                                          </div>
-                                        </div>
-                                        <div className="overflow-x-auto">
-                                          <table className="w-full text-[11px] text-left border-collapse">
-                                            <thead>
-                                              <tr className="border-b border-white/30 text-gray-300">
-                                                {Object.keys(aliRows[0]).map((col) => (
-                                                  <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
-                                                    {col.replace(/_/g, ' ')}
-                                                  </th>
-                                                ))}
-                                              </tr>
-                                            </thead>
-                                            <tbody>
-                                              {aliRows.map((row, idx2) => (
-                                                <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
-                                                  {Object.keys(aliRows[0]).map((col) => (
-                                                    <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
-                                                      {(row as any)[col] !== undefined && (row as any)[col] !== null
-                                                        ? String((row as any)[col])
-                                                        : '-'}
-                                                    </td>
-                                                  ))}
-                                                </tr>
-                                              ))}
-                                            </tbody>
-                                          </table>
-                                        </div>
-                                      </div>
-                                    )}
-
-                                    {kwpRows.length === 0 && trendsRows.length === 0 && amzRows.length === 0 && aliRows.length === 0 && (
-                                      <p className="text-[11px] text-gray-300">
-                                        No stage-level rows were found matching this product&apos;s keyword.
-                                      </p>
-                                    )}
-                                  </div>
+                                  {product.global_id || '-'}
+                                </td>
+                                <td
+                                  className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                                  style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                                >
+                                  {product.keyword ? toTitleCase(product.keyword) : '-'}
+                                </td>
+                                <td
+                                  className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                                  style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                                >
+                                  {product.title || '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
+                                </td>
+                                <td className="border border-white px-3 py-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setExpandedProductId((current) => (current === rowId ? null : rowId));
+                                    }}
+                                    className="px-3 py-1 text-xs font-semibold rounded bg-white text-black hover:bg-gray-200 transition-colors"
+                                  >
+                                    {isExpanded ? 'Hide specs' : 'Specs'}
+                                  </button>
                                 </td>
                               </tr>
-                            )}
-                          </React.Fragment>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
+                              {isExpanded && (
+                                <tr className="bg-[#25301f]">
+                                  <td colSpan={16} className="border-t border-white/20 px-3 py-3">
+                                    <div className="space-y-4">
+                                      {/* Keyword Planner specs */}
+                                      {kwpRows.length > 0 && (
+                                        <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                          <div className="flex justify-between items-center mb-2">
+                                            <h4 className="text-sm font-semibold text-[#C0FE72]">Keyword Planner details</h4>
+                                            <div className="text-[10px] text-gray-300">
+                                              Rows: {kwpRows.length}
+                                            </div>
+                                          </div>
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-[11px] text-left border-collapse">
+                                              <thead>
+                                                <tr className="border-b border-white/30 text-gray-300">
+                                                  {Object.keys(kwpRows[0]).map((col) => (
+                                                    <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                      {col.replace(/_/g, ' ')}
+                                                    </th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {kwpRows.map((row, idx2) => (
+                                                  <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                    {Object.keys(kwpRows[0]).map((col) => (
+                                                      <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                        {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                          ? String((row as any)[col])
+                                                          : '-'}
+                                                      </td>
+                                                    ))}
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      )}
 
-            {searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'POLLING' && isPreliminary && (
-              <>
-                <div className="flex justify-between items-center mb-4">
-                  <div className="text-xl font-bold text-white">
-                    Total Products: <span className="text-yellow-500">{products.length}</span>
+                                      {/* Google Trends specs */}
+                                      {trendsRows.length > 0 && (
+                                        <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                          <div className="flex justify-between items-center mb-2">
+                                            <h4 className="text-sm font-semibold text-[#C0FE72]">Google Trends details</h4>
+                                            <div className="text-[10px] text-gray-300">
+                                              Rows: {trendsRows.length}
+                                            </div>
+                                          </div>
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-[11px] text-left border-collapse">
+                                              <thead>
+                                                <tr className="border-b border-white/30 text-gray-300">
+                                                  {Object.keys(trendsRows[0]).map((col) => (
+                                                    <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                      {col.replace(/_/g, ' ')}
+                                                    </th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {trendsRows.map((row, idx2) => (
+                                                  <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                    {Object.keys(trendsRows[0]).map((col) => (
+                                                      <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                        {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                          ? String((row as any)[col])
+                                                          : '-'}
+                                                      </td>
+                                                    ))}
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* Amazon specs */}
+                                      {amzRows.length > 0 && (
+                                        <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                          <div className="flex justify-between items-center mb-2">
+                                            <h4 className="text-sm font-semibold text-[#C0FE72]">Amazon marketplace details</h4>
+                                            <div className="text-[10px] text-gray-300">
+                                              Rows: {amzRows.length}
+                                            </div>
+                                          </div>
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-[11px] text-left border-collapse">
+                                              <thead>
+                                                <tr className="border-b border-white/30 text-gray-300">
+                                                  {Object.keys(amzRows[0]).map((col) => (
+                                                    <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                      {col.replace(/_/g, ' ')}
+                                                    </th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {amzRows.map((row, idx2) => (
+                                                  <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                    {Object.keys(amzRows[0]).map((col) => (
+                                                      <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                        {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                          ? String((row as any)[col])
+                                                          : '-'}
+                                                      </td>
+                                                    ))}
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {/* Alibaba specs */}
+                                      {aliRows.length > 0 && (
+                                        <div className="p-3 bg-[#2a3627] rounded border border-white/10">
+                                          <div className="flex justify-between items-center mb-2">
+                                            <h4 className="text-sm font-semibold text-[#C0FE72]">Alibaba supplier details</h4>
+                                            <div className="text-[10px] text-gray-300">
+                                              Rows: {aliRows.length}
+                                            </div>
+                                          </div>
+                                          <div className="overflow-x-auto">
+                                            <table className="w-full text-[11px] text-left border-collapse">
+                                              <thead>
+                                                <tr className="border-b border-white/30 text-gray-300">
+                                                  {Object.keys(aliRows[0]).map((col) => (
+                                                    <th key={col} className="pb-1.5 pr-2 font-semibold uppercase tracking-wider whitespace-nowrap">
+                                                      {col.replace(/_/g, ' ')}
+                                                    </th>
+                                                  ))}
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {aliRows.map((row, idx2) => (
+                                                  <tr key={idx2} className="border-b border-white/10 hover:bg-white/5 transition-colors">
+                                                    {Object.keys(aliRows[0]).map((col) => (
+                                                      <td key={col} className="py-1 pr-2 text-gray-100 whitespace-nowrap">
+                                                        {(row as any)[col] !== undefined && (row as any)[col] !== null
+                                                          ? String((row as any)[col])
+                                                          : '-'}
+                                                      </td>
+                                                    ))}
+                                                  </tr>
+                                                ))}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                      {kwpRows.length === 0 && trendsRows.length === 0 && amzRows.length === 0 && aliRows.length === 0 && (
+                                        <p className="text-[11px] text-gray-300">
+                                          No stage-level rows were found matching this product&apos;s keyword.
+                                        </p>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
                   </div>
+                </>
+              )
+            }
+
+            {
+              searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'POLLING' && isPreliminary && (
+                <>
+                  <div className="flex justify-between items-center mb-4">
+                    <div className="text-xl font-bold text-white">
+                      Total Products: <span className="text-yellow-500">{products.length}</span>
+                    </div>
+                    <div className="text-center">
+                      <p className="text-yellow-500 text-4xl font-bold mb-2">PRELIMINARY / PROCESSING</p>
+                    </div>
+                    <div className="w-48"></div> {/* Spacer for symmetry */}
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm opacity-70">
+                      <thead>
+                        <tr className="bg-yellow-600 text-black">
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-600"
+                            style={{ minWidth: '120px', borderRight: '2px solid white' }}
+                          >
+                            Global ID
+                          </th>
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-600"
+                            style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                          >
+                            Keyword
+                          </th>
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-600"
+                            style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                          >
+                            Title
+                          </th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {products.map((product, index) => (
+                          <tr
+                            key={`${product.global_id || product.product_id || 'prod'}-${index}`}
+                            className="group hover:bg-[#3d4d3a] transition-colors"
+                          >
+                            <td
+                              className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                              style={{ minWidth: '120px', borderRight: '2px solid white' }}
+                            >
+                              {product.global_id || '-'}
+                            </td>
+                            <td
+                              className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                              style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                            >
+                              {product.keyword ? toTitleCase(product.keyword) : '-'}
+                            </td>
+                            <td
+                              className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                              style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                            >
+                              {product.title || '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )
+            }
+
+            {
+              searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'IDLE' && (
+                <div className="mt-8">
+                  <div className="flex justify-between items-center mb-4 border-b border-white/20 pb-4">
+                    <h2 className="text-2xl font-bold tracking-wider">PRODUCT RESULTS</h2>
+                    <div className="text-xl font-bold text-white">
+                      Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                    </div>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
+                      <thead>
+                        <tr className="bg-yellow-500 text-black">
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
+                            style={{ minWidth: '120px', borderRight: '2px solid white' }}
+                          >
+                            Global ID
+                          </th>
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
+                            style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                          >
+                            Keyword
+                          </th>
+                          <th
+                            className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
+                            style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                          >
+                            Title
+                          </th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
+                          <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {products.map((product, index) => (
+                          <tr
+                            key={`${product.global_id || product.product_id || 'prod'}-${index}`}
+                            className="group hover:bg-[#3d4d3a] transition-colors"
+                          >
+                            <td
+                              className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                              style={{ minWidth: '120px', borderRight: '2px solid white' }}
+                            >
+                              {product.global_id || '-'}
+                            </td>
+                            <td
+                              className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                              style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
+                            >
+                              {product.keyword ? toTitleCase(product.keyword) : '-'}
+                            </td>
+                            <td
+                              className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
+                              style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
+                            >
+                              {product.title || '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
+                            </td>
+                            <td className="border border-white px-3 py-2">
+                              {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )
+            }
+            {
+              searchingMode !== 'CATEGORY BASED' && products.length === 0 && !isLoading && !error && hasPerformedSearch && (
+                <div className="flex flex-col items-center justify-center min-h-[300px] bg-[#32402F] rounded-lg border border-white/20">
                   <div className="text-center">
-                    <p className="text-yellow-500 text-4xl font-bold mb-2">PRELIMINARY / PROCESSING</p>
-                  </div>
-                  <div className="w-48"></div> {/* Spacer for symmetry */}
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm opacity-70">
-                    <thead>
-                      <tr className="bg-yellow-600 text-black">
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-600"
-                          style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                        >
-                          Global ID
-                        </th>
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-600"
-                          style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                        >
-                          Keyword
-                        </th>
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-600"
-                          style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                        >
-                          Title
-                        </th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {products.map((product, index) => (
-                        <tr
-                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
-                          className="group hover:bg-[#3d4d3a] transition-colors"
-                        >
-                          <td
-                            className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
-                            style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                          >
-                            {product.global_id || '-'}
-                          </td>
-                          <td
-                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
-                            style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                          >
-                            {product.keyword ? toTitleCase(product.keyword) : '-'}
-                          </td>
-                          <td
-                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
-                            style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                          >
-                            {product.title || '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
-
-            {searchingMode !== 'CATEGORY BASED' && products.length > 0 && pipelineStatus === 'IDLE' && (
-              <div className="mt-8">
-                <div className="flex justify-between items-center mb-4 border-b border-white/20 pb-4">
-                  <h2 className="text-2xl font-bold tracking-wider">PRODUCT RESULTS</h2>
-                  <div className="text-xl font-bold text-white">
-                    Total Products: <span className="text-[#C0FE72]">{products.length}</span>
+                    <p className="text-[#C0FE72] text-4xl font-bold mb-4">NO RESULTS FOUND</p>
+                    <p className="text-gray-300 text-lg">We couldn't find any products matching your criteria.</p>
+                    <button
+                      onClick={handleReset}
+                      className="mt-6 px-6 py-2 bg-yellow-500 text-black font-bold rounded hover:bg-yellow-400 transition-colors"
+                    >
+                      CLEAR FILTERS
+                    </button>
                   </div>
                 </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full border-separate border-spacing-0 border border-white bg-[#32402F] text-sm">
-                    <thead>
-                      <tr className="bg-yellow-500 text-black">
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky left-0 z-10 bg-yellow-500"
-                          style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                        >
-                          Global ID
-                        </th>
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                          style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                        >
-                          Keyword
-                        </th>
-                        <th
-                          className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap sticky z-10 bg-yellow-500"
-                          style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                        >
-                          Title
-                        </th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Base Price (USD)</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Category</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Search Category</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">FCL Price (USD)</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Keyword Interest Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Avg Monthly Searches</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Margin %</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Trend Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Supplier Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Price Comp Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Final Score</th>
-                        <th className="border border-white px-3 py-2 text-left font-bold whitespace-nowrap">Rank</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {products.map((product, index) => (
-                        <tr
-                          key={`${product.global_id || product.product_id || 'prod'}-${index}`}
-                          className="group hover:bg-[#3d4d3a] transition-colors"
-                        >
-                          <td
-                            className="border border-white px-3 py-2 sticky left-0 z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
-                            style={{ minWidth: '120px', borderRight: '2px solid white' }}
-                          >
-                            {product.global_id || '-'}
-                          </td>
-                          <td
-                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
-                            style={{ left: '120px', minWidth: '150px', borderRight: '2px solid white' }}
-                          >
-                            {product.keyword ? toTitleCase(product.keyword) : '-'}
-                          </td>
-                          <td
-                            className="border border-white px-3 py-2 sticky z-10 bg-[#32402F] group-hover:bg-[#3d4d3a]"
-                            style={{ left: '270px', minWidth: '200px', borderRight: '2px solid white', boxShadow: '2px 0 0 0 white' }}
-                          >
-                            {product.title || '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.base_price_usd !== undefined && product.base_price_usd !== null) ? `$${Number(product.base_price_usd).toFixed(2)}` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.category_leaf || product.category) ? toTitleCase(product.category_leaf || product.category || '') : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.search_category) ? toTitleCase(product.search_category || '') : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.fcl_price_usd !== undefined && product.fcl_price_usd !== null) ? `$${Number(product.fcl_price_usd).toFixed(2)}` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.keyword_interest_score !== undefined && product.keyword_interest_score !== null) ? product.keyword_interest_score : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.avg_monthly_searches !== undefined && product.avg_monthly_searches !== null) ? Number(product.avg_monthly_searches).toLocaleString() : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.margin_pct !== undefined && product.margin_pct !== null) ? `${Number(product.margin_pct).toFixed(2)}%` : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.trend_score !== undefined && product.trend_score !== null) ? Math.round(Number(product.trend_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.supplier_score !== undefined && product.supplier_score !== null) ? Math.round(Number(product.supplier_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.price_comp_score !== undefined && product.price_comp_score !== null) ? Math.round(Number(product.price_comp_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.final_score !== undefined && product.final_score !== null) ? Math.round(Number(product.final_score)) : '-'}
-                          </td>
-                          <td className="border border-white px-3 py-2">
-                            {(product.rank !== undefined && product.rank !== null) ? product.rank : '-'}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-            {searchingMode !== 'CATEGORY BASED' && products.length === 0 && !isLoading && !error && hasPerformedSearch && (
-              <div className="flex flex-col items-center justify-center min-h-[300px] bg-[#32402F] rounded-lg border border-white/20">
-                <div className="text-center">
-                  <p className="text-[#C0FE72] text-4xl font-bold mb-4">NO RESULTS FOUND</p>
-                  <p className="text-gray-300 text-lg">We couldn't find any products matching your criteria.</p>
-                  <button
-                    onClick={handleReset}
-                    className="mt-6 px-6 py-2 bg-yellow-500 text-black font-bold rounded hover:bg-yellow-400 transition-colors"
-                  >
-                    CLEAR FILTERS
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
+              )
+            }
+          </div >
+        )
+        }
+      </div >
+    </div >
   );
 };
 
 export default Dashboard;
+
 
 
 

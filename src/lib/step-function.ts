@@ -1,34 +1,19 @@
-
 import { SFNClient, StartExecutionCommand, DescribeExecutionCommand, StopExecutionCommand, GetExecutionHistoryCommand } from "@aws-sdk/client-sfn";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { parquetReadObjects } from "hyparquet";
-import { getRelatedQueriesForCategory } from "./google-trends-keywords";
-import { discoverCategoryKeywords } from "./category-keywords";
 
-const sfnClient = new SFNClient({
-    region: process.env.AWS_REGION || "eu-north-1",
-    // credentials: {
-    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    // },
-});
+// ─── Structured logger (module-scoped) ────────────────────────────────────────
+const log = {
+    info: (msg: string, ...args: unknown[]) => console.log(`[step-function] [INFO]  ${msg}`, ...args),
+    warn: (msg: string, ...args: unknown[]) => console.warn(`[step-function] [WARN]  ${msg}`, ...args),
+    error: (msg: string, ...args: unknown[]) => console.error(`[step-function] [ERROR] ${msg}`, ...args),
+};
 
-const s3Client = new S3Client({
-    region: process.env.AWS_REGION || "eu-north-1",
-    // credentials: {
-    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    // },
-});
-
-const lambdaClient = new LambdaClient({
-    region: process.env.AWS_REGION || "eu-north-1",
-    // credentials: {
-    //     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    //     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    // },
-});
+// ─── AWS SDK clients (credentials resolved via IAM role / env vars automatically) ─
+const sfnClient = new SFNClient({ region: process.env.AWS_REGION || "eu-north-1" });
+const s3Client = new S3Client({ region: process.env.AWS_REGION || "eu-north-1" });
+const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION || "eu-north-1" });
 
 let STATE_MACHINE_ARN = process.env.STEP_FUNCTION_ARN;
 
@@ -80,12 +65,16 @@ export interface PipelineFilters {
     verified_supplier?: boolean;
 }
 
+/** Safely parse an integer from a string/number value, returning `fallback` on failure. */
 function ensureInt(val: string | number | undefined, fallback: number): number {
     if (val === undefined || val === null || val === '') return fallback;
     return typeof val === 'number' ? Math.floor(val) : parseInt(val) || fallback;
 }
 
-/** Build pipeline input and start a single Step Function execution. Used for manual/auto and for each keyword in category search. */
+/**
+ * Build the Step Function input payload and start a single execution.
+ * Called for every keyword in both manual and category search modes.
+ */
 async function buildInputAndStartExecution(
     keyword: string,
     filters: PipelineFilters,
@@ -154,87 +143,122 @@ async function buildInputAndStartExecution(
         input,
     });
 
+    log.info(`Starting execution "${executionName}" for keyword "${keyword}" (mode=${search_mode})`);
     const response = await sfnClient.send(command);
+    log.info(`Execution started: ${response.executionArn}`);
     return { executionArn: response.executionArn!, executionName };
 }
 
-export async function startPipelineExecution(keyword: string, filters: PipelineFilters = {}, search_mode: string = 'manual_search') {
+export async function startPipelineExecution(
+    keyword: string,
+    filters: PipelineFilters = {},
+    search_mode: string = 'manual_search'
+) {
     if (!STATE_MACHINE_ARN) {
-        console.error("Environment variables:", {
+        log.error("STEP_FUNCTION_ARN is not set.", {
             STEP_FUNCTION_ARN: process.env.STEP_FUNCTION_ARN,
             AWS_REGION: process.env.AWS_REGION,
-            NODE_ENV: process.env.NODE_ENV
+            NODE_ENV: process.env.NODE_ENV,
         });
-        throw new Error("STEP_FUNCTION_ARN environment variable is not defined. Please check your .env.local file and restart the development server.");
+        throw new Error("STEP_FUNCTION_ARN environment variable is not defined. Check .env.local and restart the dev server.");
     }
 
-    console.log("Triggering pipeline for keyword:", keyword, "with filters:", filters, "mode:", search_mode);
+    log.info(`Pipeline trigger — mode=${search_mode}, keyword="${keyword}", geo=${filters.location ?? 'N/A'}, category="${filters.category ?? 'N/A'}"`);
 
     if (search_mode === 'category_search') {
-        // Generate keywords: prefer SerpAPI discovery (seeds + autocomplete + shopping), else Google Trends relatedQueries, else category name
-        const category = filters.category;
-        const geo = filters.location ?? "";
-        const trend_window_months = ensureInt(filters.trendPeriod, 12);
+        // ── Keyword generation via Selenium scraper (Google Trends Trending Now page)
+        // Uses the /api/trends/trending-now internal endpoint which spawns a headless Chrome
+        // session and scrapes real-time trending topics for the selected category and geo.
+        const categoryDisplayName = filters.category ?? "";
+        const geo = filters.location ?? "US";
         const variant_limit = ensureInt(filters.variantLimitMax, 50);
 
+        // Map category display name → GT numeric ID
+        // GT_CATEGORY_IDS is imported from the API route file
+        const GT_CATEGORY_IDS: Record<string, number> = {
+            "All categories": 0,
+            "Autos and Vehicles": 1,
+            "Beauty and Fashion": 2,
+            "Business and Finance": 3,
+            "Climate": 20,
+            "Entertainment": 4,
+            "Food and Drink": 5,
+            "Games": 6,
+            "Health": 7,
+            "Hobbies and Leisure": 8,
+            "Jobs and Education": 9,
+            "Law and Government": 10,
+            "Other": 11,
+            "Pets and Animals": 13,
+            "Politics": 14,
+            "Science": 15,
+            "Shopping": 16,
+            "Sports": 17,
+            "Technology": 18,
+            "Travel and Transportation": 19,
+        };
+        const categoryId = GT_CATEGORY_IDS[categoryDisplayName] ?? 0;
+
         try {
-            let rawKeywords: string[] = [];
+            // Call internal trending-now API (Selenium scraper)
+            // Resolve to the local Next.js server URL — works in both dev and production
+            const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+            const url = new URL("/api/trends/trending-now", baseUrl);
+            url.searchParams.set("geo", geo.toUpperCase());
+            url.searchParams.set("category", String(categoryId));
+            url.searchParams.set("hours", "168"); // Always use 7-day window (GT Trending Now max)
+            url.searchParams.set("limit", String(Math.min(variant_limit, 100)));
 
-            rawKeywords = await discoverCategoryKeywords(category ?? "", geo, {
-                limit: variant_limit,
-                maxSeeds: 5,
-            });
+            log.info(`Calling Selenium scraper: GET ${url.toString()}`);
 
-            if (rawKeywords.length === 0) {
-                const endDate = new Date();
-                const startDate = new Date();
-                startDate.setMonth(startDate.getMonth() - trend_window_months);
-                rawKeywords = await getRelatedQueriesForCategory(category ?? "", geo, {
-                    startTime: startDate,
-                    endTime: endDate,
-                    limit: variant_limit,
-                });
-                if (rawKeywords.length > 0) {
-                    console.log("Category search: Using Google Trends fallback for", category);
-                }
-            } else {
-                console.log("Category search: Using SerpAPI discovery for", category);
+
+            const scraperRes = await fetch(url.toString(), { method: "GET" });
+            if (!scraperRes.ok) {
+                throw new Error(`Trending-now API returned ${scraperRes.status}: ${await scraperRes.text()}`);
             }
 
-            const keywords = rawKeywords.length > 0
-                ? rawKeywords
-                : [category ?? "unknown category"];
-            if (rawKeywords.length === 0) {
-                console.log("Category search: No keywords from discovery or Trends for", category, "- using category name as keyword");
+            const scraperData = await scraperRes.json() as { keywords: string[]; count: number; error?: string };
+            let keywords: string[] = scraperData.keywords ?? [];
+
+            log.info(`Scraper returned ${keywords.length} keyword(s) for category "${categoryDisplayName}" (GT ID=${categoryId}, geo=${geo})`);
+
+            // Last-resort fallback: use the category display name as a single keyword
+            if (keywords.length === 0) {
+                keywords = [categoryDisplayName || "trending"];
+                log.warn(`Scraper returned 0 keywords — falling back to category name "${keywords[0]}"`);
+
             }
 
-            console.log("Category search: keywords for", category, ":", keywords.slice(0, 10), keywords.length > 10 ? `... (${keywords.length} total)` : "");
-
+            log.info(`Launching ${keywords.slice(0, variant_limit).length} Step Function execution(s) for category "${categoryDisplayName}"`);
             const execution_details: { keyword: string; run_id: string; execution_arn: string }[] = [];
             for (const kw of keywords.slice(0, variant_limit)) {
                 const r = await buildInputAndStartExecution(kw, filters, 'manual_search');
                 execution_details.push({ keyword: kw, run_id: r.executionName, execution_arn: r.executionArn });
             }
+            log.info(`All ${execution_details.length} execution(s) launched for category "${categoryDisplayName}"`);
 
             return {
-                executionArn: `category_search:${category}:${Date.now()}`,
+                executionArn: `category_search:${categoryDisplayName}:${Date.now()}`,
                 execution_details,
                 status: 'SUCCEEDED' as const,
                 message: 'Pipeline started'
             };
         } catch (error) {
-            console.error("Category search (Google Trends keywords):", error);
+            log.error(`Selenium keyword generation failed for category "${filters.category}".`, error);
             throw error;
         }
     }
 
+    // ── Manual / ATAI AUTO mode — single keyword execution ──────────────────
     const r = await buildInputAndStartExecution(keyword, filters, search_mode);
+    log.info(`Single execution completed: ${r.executionArn}`);
     return {
         executionArn: r.executionArn,
-        status: 'SUCCEEDED',
-        message: 'Pipeline started successfully'
+        status: 'SUCCEEDED' as const,
+        message: 'Pipeline started successfully',
     };
 }
+
 
 export async function getExecutionStatus(executionArn: string) {
     if (executionArn.startsWith('category_search:')) {
@@ -726,6 +750,11 @@ export async function getPreliminaryResults(keyword?: string, search_mode: strin
         throw error;
     }
 }
+
+
+
+
+
 
 
 
