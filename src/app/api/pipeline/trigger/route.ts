@@ -21,7 +21,7 @@ export async function POST(request: NextRequest) {
 
         return NextResponse.json({
             execution_details: result.execution_details,
-            success: result.status !== 'FAILED',
+            success: !!result.status,
             executionArn: result.executionArn,
             message: result.message
         });
