@@ -59,7 +59,8 @@ const Dashboard = () => {
   const [activeSearch, setActiveSearch] = useState(true);
   const [searchingMode, setSearchingMode] = useState('MANUAL');
   const [keywordSearch, setKeywordSearch] = useState('');
-  const [kwpMonthlySearches, setKwpMonthlySearches] = useState('');
+  const [kwpMinSearches, setKwpMinSearches] = useState('');
+  const [kwpMaxSearches, setKwpMaxSearches] = useState('');
   const [variantLimitMax, setVariantLimitMax] = useState('');
   const [resultsCap, setResultsCap] = useState('');
   const [googleTrendScore, setGoogleTrendScore] = useState(0);
@@ -339,7 +340,8 @@ const Dashboard = () => {
     // Reset All Filters to Defaults
     setKeywordSearch('');
     setProductCategory('All categories');
-    setKwpMonthlySearches('');
+    setKwpMinSearches('');
+    setKwpMaxSearches('');
     setBlacklistedWords('');
     setGoogleTrendScore(0);
     setPriceMin(0);
@@ -376,7 +378,8 @@ const Dashboard = () => {
     setActiveSearch(true);
     setSearchingMode('MANUAL');
     setKeywordSearch('');
-    setKwpMonthlySearches('');
+    setKwpMinSearches('');
+    setKwpMaxSearches('');
     setVariantLimitMax('');
     setResultsCap('');
     setGoogleTrendScore(0);
@@ -438,7 +441,8 @@ const Dashboard = () => {
     setLocation('');
     setSearchingMode('MANUAL');
     setKeywordSearch('');
-    setKwpMonthlySearches('');
+    setKwpMinSearches('');
+    setKwpMaxSearches('');
     setVariantLimitMax('');
     setResultsCap('');
     setGoogleTrendScore(0);
@@ -806,7 +810,8 @@ const Dashboard = () => {
       // Basic filters
       keyword: effectiveKeyword,
       category: (searchingMode === 'CATEGORY BASED' && productCategory !== 'All categories') ? productCategory : undefined,
-      search_volume_min: kwpMonthlySearches || undefined,
+      search_volume_min: kwpMinSearches || undefined,
+      search_volume_max: kwpMaxSearches || undefined,
       blacklist: blacklistedWords || undefined,
       location: getCountryCode(location) || undefined,
       search_mode: productsSearchMode,
@@ -834,7 +839,8 @@ const Dashboard = () => {
   }, [
     keywordSearch,
     selectedCategoryVariant,
-    kwpMonthlySearches,
+    kwpMinSearches,
+    kwpMaxSearches,
     blacklistedWords,
     location,
     googleTrendScore,
@@ -970,7 +976,8 @@ const Dashboard = () => {
             alibabaFilters,
             blacklist: blacklistedWords || undefined,
             fcl_percentage: fcl,
-            search_volume_min: kwpMonthlySearches ? parseInt(kwpMonthlySearches) : undefined,
+            search_volume_min: kwpMinSearches ? parseInt(kwpMinSearches) : undefined,
+            search_volume_max: kwpMaxSearches ? parseInt(kwpMaxSearches) : undefined,
             google_trend_score: googleTrendScore > 0 ? googleTrendScore : undefined,
             amz_price_min: amazonFilters && priceMin > 0 ? priceMin : undefined,
             amz_price_max: amazonFilters && priceMax < 100 ? priceMax : undefined,
@@ -1053,7 +1060,8 @@ const Dashboard = () => {
     productCategory,
     blacklistedWords,
     fcl,
-    kwpMonthlySearches,
+    kwpMinSearches,
+    kwpMaxSearches,
     googleTrendScore,
     priceMin,
     priceMax,
@@ -1086,7 +1094,8 @@ const Dashboard = () => {
           category: lastSearchContext.category,
           location: lastSearchContext.location,
           search_mode: productsSearchMode,
-          search_volume_min: kwpMonthlySearches || undefined,
+          search_volume_min: kwpMinSearches || undefined,
+          search_volume_max: kwpMaxSearches || undefined,
           blacklist: blacklistedWords || undefined,
           ...(googleTrendScore > 0 && { google_trend_score: googleTrendScore }),
           amazonFilters,
@@ -1116,7 +1125,8 @@ const Dashboard = () => {
     hasPerformedSearch,
     activeSearch,
     pipelineStatus,
-    kwpMonthlySearches,
+    kwpMinSearches,
+    kwpMaxSearches,
     blacklistedWords,
     googleTrendScore,
     amazonFilters,
@@ -1732,12 +1742,31 @@ const Dashboard = () => {
           </div>
           <div>
             <label className="block text-sm font-medium mb-2">KWP MONTHLY SEARCHES</label>
-            <input
-              type="text"
-              value={kwpMonthlySearches}
-              onChange={(e) => setKwpMonthlySearches(e.target.value)}
-              className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
-            />
+            <div className="flex items-center gap-2">
+              <div className="flex flex-col items-start gap-1 flex-1">
+                <span className="text-xs text-gray-300">MIN</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={kwpMinSearches}
+                  onChange={(e) => setKwpMinSearches(e.target.value)}
+                  placeholder="e.g. 1000"
+                  className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+              <span className="text-gray-300 mt-5">–</span>
+              <div className="flex flex-col items-start gap-1 flex-1">
+                <span className="text-xs text-gray-300">MAX</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={kwpMaxSearches}
+                  onChange={(e) => setKwpMaxSearches(e.target.value)}
+                  placeholder="e.g. 50000"
+                  className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
           </div>
 
 
