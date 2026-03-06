@@ -57,6 +57,8 @@ export interface PipelineFilters {
     fcl_percentage?: number;
     /** Keyword planner / search volume min */
     search_volume_min?: string | number;
+    /** Keyword planner / search volume max */
+    search_volume_max?: string | number;
     /** Google Trend score min (0–100) */
     google_trend_score?: number;
     /** Amazon: price min/max */
@@ -102,6 +104,7 @@ async function buildInputAndStartExecution(
     const fcl_percentage = filters.fcl_percentage != null ? Number(filters.fcl_percentage) : 0;
     const blacklist = (filters.blacklist ?? "").toString();
     const search_volume_min = ensureInt(filters.search_volume_min, 0);
+    const search_volume_max = filters.search_volume_max != null ? Number(filters.search_volume_max) : 0;
     const google_trend_score = filters.google_trend_score != null ? Number(filters.google_trend_score) : 0;
 
     const amz_price_min = filters.amz_price_min != null ? Number(filters.amz_price_min) : 0;
@@ -117,7 +120,14 @@ async function buildInputAndStartExecution(
     const supplier_rating_min = filters.supplier_rating_min != null ? Number(filters.supplier_rating_min) : 0;
     const verified_supplier = !!filters.verified_supplier;
 
-    const executionName = `manual_${keyword.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}`;
+    // Derive a human-readable prefix from the search mode
+    const modePrefix =
+        search_mode === 'category_search' ? 'category'
+            : search_mode === 'manual_search' ? 'manual'
+                : 'run';
+    const safeKeyword = keyword.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 60);
+    const executionName = `${modePrefix}_${safeKeyword}_${Date.now()}`;
+
     const inputObj: Record<string, unknown> = {
         keyword,
         search_mode,
@@ -133,6 +143,7 @@ async function buildInputAndStartExecution(
         blacklist,
         fcl_percentage,
         search_volume_min,
+        search_volume_max,
         google_trend_score,
         amz_price_min,
         amz_price_max,
@@ -165,13 +176,17 @@ async function buildInputAndStartExecution(
 async function fetchKeywordsFromPlanner(
     category: string,
     geo: string,
-    limit: number
+    limit: number,
+    minSearches?: number,
+    maxSearches?: number
 ): Promise<string[]> {
     const CATEGORY_KEYWORD_FUNCTION = "arn:aws:lambda:eu-north-1:894037914878:function:category_keyword";
-    const payload = {
+    const payload: Record<string, unknown> = {
         search_term: category,
         geo: (geo || "US").toUpperCase(),
         limit,
+        ...(minSearches != null && minSearches > 0 && { min_searches: minSearches }),
+        ...(maxSearches != null && maxSearches > 0 && { max_searches: maxSearches }),
     };
 
     console.log("[category_keyword Lambda] Invoking for category=", category, "geo=", geo, "limit=", limit);
@@ -229,7 +244,9 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
             const rawKeywords = await fetchKeywordsFromPlanner(
                 category ?? "",
                 geo,
-                variant_limit
+                variant_limit,
+                filters.search_volume_min != null ? Number(filters.search_volume_min) : undefined,
+                filters.search_volume_max != null ? Number(filters.search_volume_max) : undefined
             );
 
             const keywords = rawKeywords.length > 0
@@ -244,7 +261,7 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
 
             const execution_details: { keyword: string; run_id: string; execution_arn: string }[] = [];
             for (const kw of keywords.slice(0, variant_limit)) {
-                const r = await buildInputAndStartExecution(kw, filters, 'manual_search');
+                const r = await buildInputAndStartExecution(kw, filters, 'category_search');
                 execution_details.push({ keyword: kw, run_id: r.executionName, execution_arn: r.executionArn });
             }
 
