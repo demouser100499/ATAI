@@ -9,40 +9,48 @@ const countries = [
   { name: 'United States', code: 'US' },
   { name: 'Canada', code: 'CA' },
   { name: 'Mexico', code: 'MX' },
-  { name: 'Belize', code: 'BZ' },
-  { name: 'Costa Rica', code: 'CR' },
+  { name: 'Guatemala', code: 'GT' },
   { name: 'El Salvador', code: 'SV' },
+  { name: 'Honduras', code: 'HN' },
+  { name: 'Nicaragua', code: 'NI' },
+  { name: 'Costa Rica', code: 'CR' },
   { name: 'Panama', code: 'PA' },
   { name: 'Colombia', code: 'CO' },
   { name: 'Argentina', code: 'AR' },
-  { name: 'Bolivia', code: 'BO' },
-  { name: 'Brazil', code: 'BR' },
-  { name: 'Chile', code: 'CL' }
 ];
 
-// Google Trends Trending Now categories → GT numeric ID
-// Source: URL param ?category=N on https://trends.google.com/trending
+// Supported Amazon product categories for Category Based search mode
 const GT_CATEGORIES = [
-  { name: 'All categories', id: 0 },
-  { name: 'Autos and Vehicles', id: 1 },
-  { name: 'Beauty and Fashion', id: 2 },
-  { name: 'Business and Finance', id: 3 },
-  { name: 'Climate', id: 21 },
-  { name: 'Entertainment', id: 13 },
-  { name: 'Food and Drink', id: 14 },
-  { name: 'Games', id: 15 },
-  { name: 'Health', id: 8 },
-  { name: 'Hobbies and Leisure', id: 20 },
-  { name: 'Jobs and Education', id: 61 },
-  { name: 'Law and Government', id: 87 },
-  { name: 'Other', id: 70 },
-  { name: 'Pets and Animals', id: 66 },
-  { name: 'Politics', id: 32 },
-  { name: 'Science', id: 16 },
-  { name: 'Shopping', id: 18 },
-  { name: 'Sports', id: 7 },
-  { name: 'Technology', id: 12 },
-  { name: 'Travel and Transportation', id: 4 },
+  'All categories',
+  'Appliances',
+  'Arts, Crafts & Sewing',
+  'Automotive Parts & Accessories',
+  'Baby',
+  'Baby Clothing, Shoes & Jewelry',
+  'Beauty & Personal Care',
+  "Boy's Clothing, Shoes & Jewelry",
+  'Cell Phones & Accessories',
+  'Clothing, Shoes & Jewelry',
+  'Collectibles & Fine Art',
+  'Computers',
+  'Electronics',
+  'Garden & Outdoor',
+  "Girl's Clothing, Shoes & Jewelry",
+  'Grocery & Gourmet Food',
+  'Handmade',
+  'Health, Household & Baby Care',
+  'Home & Kitchen',
+  'Industrial & Scientific',
+  'Luggage & Travel Gear',
+  "Men's Clothing, Shoes & Jewelry",
+  'Musical Instruments',
+  'Office Products',
+  'Pet Supplies',
+  'Smart Home',
+  'Sports & Outdoors',
+  'Tools & Home Improvement',
+  'Toys & Games',
+  "Women's Clothing, Shoes & Jewelry",
 ];
 
 const Dashboard = () => {
@@ -67,13 +75,14 @@ const Dashboard = () => {
   const [productCategory, setProductCategory] = useState('All categories');
   const [trendPeriod, setTrendPeriod] = useState('');
   const [showTrendDropdown, setShowTrendDropdown] = useState(false);
-  const [blacklistedWords, setBlacklistedWords] = useState('');
+  const [blacklistedWords, setBlacklistedWords] = useState<string[]>([]);
+  const [blacklistInput, setBlacklistInput] = useState('');
   const [amazonFilters, setAmazonFilters] = useState(true);
   const [alibabaFilters, setAlibabaFilters] = useState(true);
   const [priceMin, setPriceMin] = useState(0);
-  const [priceMax, setPriceMax] = useState(100);
+  const [priceMax, setPriceMax] = useState(0);
   const [reviewsMin, setReviewsMin] = useState(0);
-  const [reviewsMax, setReviewsMax] = useState(100);
+  const [reviewsMax, setReviewsMax] = useState(0);
   const [ratingFilter, setRatingFilter] = useState(0);
   const [fcl, setFcl] = useState(0.0);
   const [costBelow, setCostBelow] = useState(0.0);
@@ -342,12 +351,13 @@ const Dashboard = () => {
     setProductCategory('All categories');
     setKwpMinSearches('');
     setKwpMaxSearches('');
-    setBlacklistedWords('');
+    setBlacklistedWords([]);
+    setBlacklistInput('');
     setGoogleTrendScore(0);
     setPriceMin(0);
-    setPriceMax(100);
+    setPriceMax(0);
     setReviewsMin(0);
-    setReviewsMax(100);
+    setReviewsMax(0);
     setRatingFilter(0);
     setFcl(0.0);
     setCostBelow(0.0);
@@ -385,13 +395,14 @@ const Dashboard = () => {
     setGoogleTrendScore(0);
     setProductCategory('All categories');
     setTrendPeriod('');
-    setBlacklistedWords('');
+    setBlacklistedWords([]);
+    setBlacklistInput('');
     setAmazonFilters(true);
     setAlibabaFilters(true);
     setPriceMin(0);
-    setPriceMax(100);
+    setPriceMax(0);
     setReviewsMin(0);
-    setReviewsMax(100);
+    setReviewsMax(0);
     setRatingFilter(0);
     setFcl(0.00);
     setCostBelow(0.00);
@@ -448,13 +459,14 @@ const Dashboard = () => {
     setGoogleTrendScore(0);
     setProductCategory('All categories');
     setTrendPeriod('');
-    setBlacklistedWords('');
+    setBlacklistedWords([]);
+    setBlacklistInput('');
     setAmazonFilters(true);
     setAlibabaFilters(true);
     setPriceMin(0);
-    setPriceMax(100);
+    setPriceMax(0);
     setReviewsMin(0);
-    setReviewsMax(100);
+    setReviewsMax(0);
     setRatingFilter(0);
     setFcl(0.00);
     setCostBelow(0.00);
@@ -812,7 +824,7 @@ const Dashboard = () => {
       category: (searchingMode === 'CATEGORY BASED' && productCategory !== 'All categories') ? productCategory : undefined,
       search_volume_min: kwpMinSearches || undefined,
       search_volume_max: kwpMaxSearches || undefined,
-      blacklist: blacklistedWords || undefined,
+      blacklist: blacklistedWords.length > 0 ? blacklistedWords : undefined,
       location: getCountryCode(location) || undefined,
       search_mode: productsSearchMode,
       // Google Trend Score filter (when greater than 0)
@@ -824,9 +836,9 @@ const Dashboard = () => {
 
       // Amazon filters (only when AMAZON FILTERS is ON and values are set)
       ...(amazonFilters && priceMin > 0 && { amz_price_min: priceMin }),
-      ...(amazonFilters && priceMax < 100 && { amz_price_max: priceMax }),
+      ...(amazonFilters && priceMax > 0 && { amz_price_max: priceMax }),
       ...(amazonFilters && reviewsMin > 0 && { reviews_min: reviewsMin }),
-      ...(amazonFilters && reviewsMax < 100 && { reviews_max: reviewsMax }),
+      ...(amazonFilters && reviewsMax > 0 && { reviews_max: reviewsMax }),
       ...(amazonFilters && ratingFilter > 0 && { rating_min: ratingFilter }),
       ...(amazonFilters && fcl > 0 && { fcl_min: fcl }),
 
@@ -974,15 +986,15 @@ const Dashboard = () => {
             size: resultsCap ? parseInt(resultsCap) : undefined,
             amazonFilters,
             alibabaFilters,
-            blacklist: blacklistedWords || undefined,
+            blacklist: blacklistedWords.length > 0 ? blacklistedWords : undefined,
             fcl_percentage: fcl,
             search_volume_min: kwpMinSearches ? parseInt(kwpMinSearches) : undefined,
             search_volume_max: kwpMaxSearches ? parseInt(kwpMaxSearches) : undefined,
             google_trend_score: googleTrendScore > 0 ? googleTrendScore : undefined,
             amz_price_min: amazonFilters && priceMin > 0 ? priceMin : undefined,
-            amz_price_max: amazonFilters && priceMax < 100 ? priceMax : undefined,
+            amz_price_max: amazonFilters && priceMax > 0 ? priceMax : undefined,
             reviews_min: amazonFilters && reviewsMin > 0 ? reviewsMin : undefined,
-            reviews_max: amazonFilters && reviewsMax < 100 ? reviewsMax : undefined,
+            reviews_max: amazonFilters && reviewsMax > 0 ? reviewsMax : undefined,
             rating_min: amazonFilters && ratingFilter > 0 ? ratingFilter : undefined,
             fcl_min: amazonFilters && fcl > 0 ? fcl : undefined,
             margin_min: alibabaFilters && costBelow > 0 ? costBelow : undefined,
@@ -1087,16 +1099,26 @@ const Dashboard = () => {
 
     const refine = async () => {
       try {
+        if (searchingMode === 'CATEGORY BASED' && (!selectedCategoryVariant || selectedCategoryVariant === 'ALL')) {
+          setProducts([]);
+          return;
+        }
+
+        let effectiveKeyword = lastSearchContext.keyword;
+        if (searchingMode === 'CATEGORY BASED') {
+          effectiveKeyword = selectedCategoryVariant;
+        }
+
         // Category runs write to manual_search S3 path; fetch with manual_search so we read that data
         const productsSearchMode = lastSearchContext.search_mode === 'category_search' ? 'manual_search' : lastSearchContext.search_mode;
         const params: Record<string, any> = {
-          keyword: lastSearchContext.keyword,
+          keyword: effectiveKeyword,
           category: lastSearchContext.category,
           location: lastSearchContext.location,
           search_mode: productsSearchMode,
           search_volume_min: kwpMinSearches || undefined,
           search_volume_max: kwpMaxSearches || undefined,
-          blacklist: blacklistedWords || undefined,
+          blacklist: blacklistedWords.length > 0 ? blacklistedWords : undefined,
           ...(googleTrendScore > 0 && { google_trend_score: googleTrendScore }),
           amazonFilters,
           alibabaFilters,
@@ -1141,6 +1163,8 @@ const Dashboard = () => {
     moq,
     alibabaRating,
     verifiedSupplier,
+    searchingMode,
+    selectedCategoryVariant,
   ]);
 
 
@@ -1148,6 +1172,7 @@ const Dashboard = () => {
   // When user changes the category variant dropdown, clear stage data so we refetch for the selected keyword
   const handleCategoryVariantChange = useCallback((newValue: string) => {
     setSelectedCategoryVariant(newValue);
+    setProducts([]);
     setKeywordPlannerResults(null);
     setKeywordPlannerMeta(null);
     setTrendsResults(null);
@@ -1568,7 +1593,7 @@ const Dashboard = () => {
                     className="w-full px-3 py-2 text-black bg-white border border-gray-300 focus:outline-none focus:border-blue-500"
                   >
                     {GT_CATEGORIES.map((cat) => (
-                      <option key={cat.id} value={cat.name}>{cat.name}</option>
+                      <option key={cat} value={cat}>{cat}</option>
                     ))}
                   </select>
                 </div>
@@ -1673,11 +1698,68 @@ const Dashboard = () => {
           {/* Right: Blacklisted Words */}
           <div>
             <label className="block text-sm font-medium mb-2">BLACKLISTED WORDS</label>
-            <textarea
-              value={blacklistedWords}
-              onChange={(e) => setBlacklistedWords(e.target.value)}
-              className="w-full h-32 px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500 resize-none"
-            />
+            <div 
+              className="flex flex-col w-full h-32 bg-[#FFFFFF] border border-gray-600 focus-within:border-blue-500 overflow-hidden cursor-text"
+              onClick={() => document.getElementById('blacklist-input')?.focus()}
+            >
+              <div className="flex flex-wrap gap-2 p-2 overflow-y-auto w-full h-full content-start">
+                {blacklistedWords.map((word, index) => (
+                  <div key={index} className="flex items-center gap-1 bg-gray-200 text-black px-2 py-1 rounded-md text-sm border border-gray-300 shadow-sm leading-none shrink-0">
+                    <span className="max-w-[150px] truncate" title={word}>{word}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setBlacklistedWords(prev => prev.filter((_, i) => i !== index));
+                      }}
+                      className="text-gray-500 hover:text-red-500 rounded-full w-4 h-4 flex items-center justify-center font-bold text-lg leading-none shrink-0 pb-1"
+                      title="Remove word"
+                    >
+                      &times;
+                    </button>
+                  </div>
+                ))}
+                <input
+                  id="blacklist-input"
+                  type="text"
+                  value={blacklistInput}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val.includes(',')) {
+                      const newWords = val.split(',').map(w => w.trim()).filter(w => w.length > 0);
+                      if (newWords.length > 0) {
+                        setBlacklistedWords(prev => Array.from(new Set([...prev, ...newWords])));
+                      }
+                      setBlacklistInput('');
+                    } else {
+                      setBlacklistInput(val);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      const val = blacklistInput.trim();
+                      if (val) {
+                        setBlacklistedWords(prev => prev.includes(val) ? prev : [...prev, val]);
+                        setBlacklistInput('');
+                      }
+                    } else if (e.key === 'Backspace' && blacklistInput === '' && blacklistedWords.length > 0) {
+                      // Remove the last chip if backspace is pressed on empty input
+                      setBlacklistedWords(prev => prev.slice(0, -1));
+                    }
+                  }}
+                  onBlur={() => {
+                    // Automatically convert any leftover text into a chip when clicking away
+                    const val = blacklistInput.trim();
+                    if (val) {
+                      setBlacklistedWords(prev => prev.includes(val) ? prev : [...prev, val]);
+                      setBlacklistInput('');
+                    }
+                  }}
+                  placeholder={blacklistedWords.length === 0 ? "Type and press Enter or comma..." : ""}
+                  className="flex-1 min-w-[120px] bg-transparent outline-none text-black text-sm h-7"
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1751,6 +1833,7 @@ const Dashboard = () => {
                   value={kwpMinSearches}
                   onChange={(e) => setKwpMinSearches(e.target.value)}
                   placeholder="e.g. 1000"
+
                   className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
                 />
               </div>
@@ -1871,16 +1954,26 @@ const Dashboard = () => {
                 {[1, 2, 3, 4, 5].map((star) => (
                   <span
                     key={star}
+                    title={star === ratingFilter ? 'Click to clear' : `${star}★ and above`}
                     className={`text-lg ${!amazonFilters
                       ? 'cursor-not-allowed text-gray-400'
                       : `cursor-pointer ${star <= ratingFilter ? 'text-yellow-400' : 'text-gray-500'}`
                       }`}
-                    onClick={amazonFilters ? () => setRatingFilter(star) : undefined}
+                    onClick={amazonFilters ? () => setRatingFilter(star === ratingFilter ? 0 : star) : undefined}
                   >
                     ★
                   </span>
                 ))}
               </div>
+              {amazonFilters && ratingFilter > 0 && (
+                <button
+                  onClick={() => setRatingFilter(0)}
+                  className="text-xs text-gray-300 hover:text-white underline ml-1"
+                  title="Clear rating filter"
+                >
+                  ✕ Clear
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-4">
@@ -2036,16 +2129,26 @@ const Dashboard = () => {
                 {[1, 2, 3, 4, 5].map((star) => (
                   <span
                     key={star}
+                    title={star === alibabaRating ? 'Click to clear' : `${star}★ and above`}
                     className={`text-lg ${!alibabaFilters
                       ? 'cursor-not-allowed text-gray-400'
                       : `cursor-pointer ${star <= alibabaRating ? 'text-yellow-400' : 'text-gray-500'}`
                       }`}
-                    onClick={alibabaFilters ? () => setAlibabaRating(star) : undefined}
+                    onClick={alibabaFilters ? () => setAlibabaRating(star === alibabaRating ? 0 : star) : undefined}
                   >
                     ★
                   </span>
                 ))}
               </div>
+              {alibabaFilters && alibabaRating > 0 && (
+                <button
+                  onClick={() => setAlibabaRating(0)}
+                  className="text-xs text-gray-300 hover:text-white underline ml-1"
+                  title="Clear rating filter"
+                >
+                  ✕ Clear
+                </button>
+              )}
             </div>
 
             <div className={`flex items-center gap-2 px-3 py-1 ${!alibabaFilters ? 'bg-gray-300' : 'bg-white'}`}>

@@ -52,7 +52,7 @@ export interface PipelineFilters {
     size?: string | number;
     amazonFilters?: boolean;
     alibabaFilters?: boolean;
-    blacklist?: string;
+    blacklist?: string[];
     /** FCL percentage (0–1) for amazon_fcl_enrichment */
     fcl_percentage?: number;
     /** Keyword planner / search volume min */
@@ -102,7 +102,7 @@ async function buildInputAndStartExecution(
     const enable_alibaba = !!filters.alibabaFilters;
 
     const fcl_percentage = filters.fcl_percentage != null ? Number(filters.fcl_percentage) : 0;
-    const blacklist = (filters.blacklist ?? "").toString();
+    const blacklist = filters.blacklist ?? [];
     const search_volume_min = ensureInt(filters.search_volume_min, 0);
     const search_volume_max = filters.search_volume_max != null ? Number(filters.search_volume_max) : 0;
     const google_trend_score = filters.google_trend_score != null ? Number(filters.google_trend_score) : 0;
