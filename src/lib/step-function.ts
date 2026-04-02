@@ -173,7 +173,7 @@ async function buildInputAndStartExecution(
  * Invoke the `category_keyword` Lambda to retrieve relevant keywords
  * from Google Keyword Planner for the given category / search term.
  */
-async function fetchKeywordsFromPlanner(
+export async function fetchKeywordsFromPlanner(
     category: string,
     geo: string,
     limit: number,
@@ -232,6 +232,16 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
 
     console.log("Triggering pipeline for keyword:", keyword, "with filters:", filters, "mode:", search_mode);
 
+    if (search_mode === 'category_child') {
+        // Bypass the keyword generation loop, but pass 'category_search' to downstream
+        const r = await buildInputAndStartExecution(keyword, filters, 'category_search');
+        return {
+            executionArn: r.executionArn,
+            status: 'SUCCEEDED' as const,
+            message: 'Pipeline started successfully'
+        };
+    }
+
     if (search_mode === 'category_search') {
         // Generate keywords: prefer SerpAPI discovery (seeds + autocomplete + shopping), else Google Trends relatedQueries, else category name
         const category = filters.category;
@@ -259,8 +269,16 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
 
             console.log("Category search: keywords for", category, ":", keywords.slice(0, 10), keywords.length > 10 ? `... (${keywords.length} total)` : "");
 
+            const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
             const execution_details: { keyword: string; run_id: string; execution_arn: string }[] = [];
-            for (const kw of keywords.slice(0, variant_limit)) {
+            
+            const variant_keywords = keywords.slice(0, variant_limit);
+            for (let i = 0; i < variant_keywords.length; i++) {
+                const kw = variant_keywords[i];
+                if (i > 0) {
+                    console.log(`[Category Search] Waiting 15 seconds before triggering step function for next keyword: ${kw}`);
+                    await sleep(15000);
+                }
                 const r = await buildInputAndStartExecution(kw, filters, 'category_search');
                 execution_details.push({ keyword: kw, run_id: r.executionName, execution_arn: r.executionArn });
             }
