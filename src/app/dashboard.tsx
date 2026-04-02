@@ -89,7 +89,160 @@ const Dashboard = () => {
   const [moq, setMoq] = useState('');
   const [alibabaRating, setAlibabaRating] = useState(0);
   const [verifiedSupplier, setVerifiedSupplier] = useState(false);
-  const [savePreset, setSavePreset] = useState('SAVE PRESET 1');
+
+  // ── Preset system (dynamic — starts empty) ───────────────────────────────
+  type PresetData = {
+    location: string;
+    trendPeriod: string;
+    variantLimitMax: string;
+    resultsCap: string;
+    kwpMinSearches: string;
+    kwpMaxSearches: string;
+    blacklistedWords: string[];
+    googleTrendScore: number;
+    amazonFilters: boolean;
+    priceMin: number;
+    priceMax: number;
+    reviewsMin: number;
+    reviewsMax: number;
+    ratingFilter: number;
+    fcl: number;
+    alibabaFilters: boolean;
+    costBelow: number;
+    moq: string;
+    alibabaRating: number;
+    verifiedSupplier: boolean;
+  };
+  type PresetSlot = { id: number; name: string; data: PresetData };
+
+  const [presets, setPresets] = useState<PresetSlot[]>([]);
+  const [presetCounter, setPresetCounter] = useState(0);
+  const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
+  const [presetSaveFlash, setPresetSaveFlash] = useState(false);
+  const [editingPresetId, setEditingPresetId] = useState<number | null>(null);
+  const [presetNameInput, setPresetNameInput] = useState('');
+
+  // Load presets from server on mount (shared across all users)
+  const [presetDropdownOpen, setPresetDropdownOpen] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/presets')
+      .then(r => r.json())
+      .then((stored: { list: PresetSlot[]; counter: number }) => {
+        setPresets(stored.list || []);
+        setPresetCounter(stored.counter || 0);
+        if (stored.list?.length > 0) setSelectedPresetId(stored.list[0].id);
+      })
+      .catch(e => console.error('Failed to load presets', e));
+  }, []);
+
+  const getFiltersSnapshot = useCallback((): PresetData => ({
+    location,
+    trendPeriod,
+    variantLimitMax,
+    resultsCap,
+    kwpMinSearches,
+    kwpMaxSearches,
+    blacklistedWords,
+    googleTrendScore,
+    amazonFilters,
+    priceMin,
+    priceMax,
+    reviewsMin,
+    reviewsMax,
+    ratingFilter,
+    fcl,
+    alibabaFilters,
+    costBelow,
+    moq,
+    alibabaRating,
+    verifiedSupplier,
+  }), [location, trendPeriod, variantLimitMax, resultsCap, kwpMinSearches, kwpMaxSearches,
+    blacklistedWords, googleTrendScore, amazonFilters, priceMin, priceMax, reviewsMin, reviewsMax,
+    ratingFilter, fcl, alibabaFilters, costBelow, moq, alibabaRating, verifiedSupplier]);
+
+  // Save current filters as a brand-new preset slot (server-side)
+  const handleSaveNewPreset = useCallback(async () => {
+    const data = getFiltersSnapshot();
+    try {
+      const res = await fetch('/api/presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save_new', data }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        setPresets(prev => [...prev, result.preset]);
+        setPresetCounter(result.counter);
+        setSelectedPresetId(result.preset.id);
+        setPresetSaveFlash(true);
+        setTimeout(() => setPresetSaveFlash(false), 1500);
+      }
+    } catch (e) {
+      console.error('Failed to save preset', e);
+    }
+  }, [getFiltersSnapshot]);
+
+  const handleLoadPreset = useCallback(() => {
+    const slot = presets.find(p => p.id === selectedPresetId);
+    if (!slot) return;
+    const d = slot.data;
+    setLocation(d.location ?? '');
+    setTrendPeriod(d.trendPeriod ?? '');
+    setVariantLimitMax(d.variantLimitMax ?? '');
+    setResultsCap(d.resultsCap ?? '');
+    setKwpMinSearches(d.kwpMinSearches ?? '');
+    setKwpMaxSearches(d.kwpMaxSearches ?? '');
+    setBlacklistedWords(Array.isArray(d.blacklistedWords) ? d.blacklistedWords : []);
+    setBlacklistInput('');
+    setGoogleTrendScore(d.googleTrendScore ?? 0);
+    setAmazonFilters(d.amazonFilters ?? true);
+    setPriceMin(d.priceMin ?? 0);
+    setPriceMax(d.priceMax ?? 0);
+    setReviewsMin(d.reviewsMin ?? 0);
+    setReviewsMax(d.reviewsMax ?? 0);
+    setRatingFilter(d.ratingFilter ?? 0);
+    setFcl(d.fcl ?? 0);
+    setAlibabaFilters(d.alibabaFilters ?? true);
+    setCostBelow(d.costBelow ?? 0);
+    setMoq(d.moq ?? '');
+    setAlibabaRating(d.alibabaRating ?? 0);
+    setVerifiedSupplier(d.verifiedSupplier ?? false);
+  }, [presets, selectedPresetId]);
+
+  const handleDeletePreset = useCallback(async (id: number) => {
+    try {
+      await fetch('/api/presets', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      const updated = presets.filter(p => p.id !== id);
+      setPresets(updated);
+      if (selectedPresetId === id) {
+        setSelectedPresetId(updated.length > 0 ? updated[updated.length - 1].id : null);
+      }
+    } catch (e) {
+      console.error('Failed to delete preset', e);
+    }
+  }, [presets, selectedPresetId]);
+
+  const handleRenamePreset = useCallback(async (id: number, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) { setEditingPresetId(null); return; }
+    try {
+      await fetch('/api/presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'rename', id, name: trimmed }),
+      });
+      setPresets(prev => prev.map(p => p.id === id ? { ...p, name: trimmed } : p));
+      setEditingPresetId(null);
+    } catch (e) {
+      console.error('Failed to rename preset', e);
+    }
+  }, []);
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Products API state
   const [products, setProducts] = useState<Product[]>([]);
@@ -815,8 +968,7 @@ const Dashboard = () => {
       effectiveKeyword = keywordSearch || undefined;
     }
 
-    // Category runs use manual_search Step Function executions, so ranked output lives under manual_search S3 path; fetch with manual_search so we read that data
-    const productsSearchMode = searchingMode === 'CATEGORY BASED' ? 'manual_search' : (searchModeMap[searchingMode] || 'manual_search');
+    const productsSearchMode = searchModeMap[searchingMode] || 'manual_search';
 
     return {
       // Basic filters
@@ -1004,7 +1156,105 @@ const Dashboard = () => {
           }
         };
 
-        const triggerResponse = await fetch('/api/pipeline/trigger', {
+        if (searchingMode === 'CATEGORY BASED') {
+          // Frontend-driven category search orchestration
+          setStatusMessage('GENERATING KEYWORDS...');
+          
+          const kwResponse = await fetch('/api/pipeline/generate-keywords', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              category: searchCategory,
+              geo: searchLocation,
+              limit: variantLimitMax ? parseInt(variantLimitMax) : 50,
+              search_volume_min: kwpMinSearches ? parseInt(kwpMinSearches) : undefined,
+              search_volume_max: kwpMaxSearches ? parseInt(kwpMaxSearches) : undefined
+            })
+          });
+
+          if (!kwResponse.ok) {
+            const errData = await kwResponse.json();
+            throw new Error(errData.error || 'Failed to generate keywords');
+          }
+
+          const kwData = await kwResponse.json();
+          const generatedKeywords: string[] = kwData.keywords || [];
+
+          // Initialize UI with PENDING statuses
+          const initialExecutions = generatedKeywords.map(kw => ({
+            keyword: kw,
+            run_id: '',
+            execution_arn: '',
+            status: 'PENDING'
+          }));
+          setCategoryExecutions(initialExecutions);
+          setCategoryKeywordsPreview(generatedKeywords);
+          setExecutionArn(`category_search:frontend_managed:${Date.now()}`); // Mock ARN to trigger polling loop later
+          setStatusMessage('STARTING VARIANTS...');
+          
+          // Fire and forget the sequential triggering logic
+          (async () => {
+            const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+            
+            for (let i = 0; i < generatedKeywords.length; i++) {
+              const kw = generatedKeywords[i];
+              
+              if (i > 0) {
+                 setStatusMessage(`WAITING 15s BEFORE: ${kw}`);
+                 await sleep(15000);
+              }
+              
+              setCategoryExecutions(prev => {
+                const next = [...prev];
+                next[i] = { ...next[i], status: 'STARTING' };
+                return next;
+              });
+
+              setStatusMessage(`TRIGGERING: ${kw}`);
+              try {
+                const triggerPayload = { ...payload, keyword: kw, search_mode: 'category_child' };
+                const triggerRes = await fetch('/api/pipeline/trigger', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(triggerPayload)
+                });
+                
+                const triggerData = await triggerRes.json();
+                
+                if (triggerRes.ok && triggerData.success) {
+                  setCategoryExecutions(prev => {
+                    const next = [...prev];
+                    next[i] = { 
+                      ...next[i], 
+                      status: 'RUNNING',
+                      execution_arn: triggerData.executionArn,
+                      run_id: triggerData.executionArn.split(':').pop() || '',
+                    };
+                    return next;
+                  });
+                } else {
+                   setCategoryExecutions(prev => {
+                    const next = [...prev];
+                    next[i] = { ...next[i], status: 'FAILED' };
+                    return next;
+                  });
+                }
+              } catch (e) {
+                console.error(`Failed to trigger category child for ${kw}:`, e);
+                setCategoryExecutions(prev => {
+                  const next = [...prev];
+                  next[i] = { ...next[i], status: 'FAILED' };
+                  return next;
+                });
+              }
+            }
+            setStatusMessage('RUNNING');
+            setPipelineStatus('POLLING');
+          })();
+
+        } else {
+          // Normal manual/auto search
+          const triggerResponse = await fetch('/api/pipeline/trigger', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -1021,19 +1271,13 @@ const Dashboard = () => {
           throw new Error(triggerData.message || 'No data found for this search');
         }
 
-        if (triggerData.execution_details) {
-          setCategoryExecutions(triggerData.execution_details.map((ex: any) => ({ ...ex, status: 'RUNNING' })));
-          // Show which keywords were generated from Google Trends for this category run
-          setCategoryKeywordsPreview(triggerData.execution_details.map((ex: { keyword?: string }) => ex.keyword).filter(Boolean));
-        } else {
-          setCategoryExecutions([]);
-          setCategoryKeywordsPreview(searchingMode === 'CATEGORY BASED' ? [] : null);
-        }
-
+        setCategoryExecutions([]);
+        setCategoryKeywordsPreview(null);
         setExecutionArn(triggerData.executionArn);
         setPipelineStatus('POLLING');
         setStatusMessage('RUNNING');
-
+        
+        } // end generic else
         // Note: status polling is now handled by the Polling Effect below
       } else {
         // Active Search is OFF - just refine / fetch products from the latest consolidated dataset
@@ -1109,8 +1353,7 @@ const Dashboard = () => {
           effectiveKeyword = selectedCategoryVariant;
         }
 
-        // Category runs write to manual_search S3 path; fetch with manual_search so we read that data
-        const productsSearchMode = lastSearchContext.search_mode === 'category_search' ? 'manual_search' : lastSearchContext.search_mode;
+        const productsSearchMode = lastSearchContext.search_mode;
         const params: Record<string, any> = {
           keyword: effectiveKeyword,
           category: lastSearchContext.category,
@@ -1290,11 +1533,14 @@ const Dashboard = () => {
             if (childStatusCounter >= 3) {
               childStatusCounter = 0;
               const updatedExecutions = await Promise.all(categoryExecutions.map(async (exec) => {
+                // Ignore ones that haven't been assigned an ARN yet or are already finished
+                if (exec.status === 'PENDING' || exec.status === 'STARTING' || !exec.execution_arn) return exec;
                 if (exec.status === 'SUCCEEDED' || exec.status === 'FAILED' || exec.status === 'ABORTED' || exec.status === 'TIMED_OUT') return exec;
+                
                 try {
                   const res = await fetch(`/api/pipeline/status?arn=${exec.execution_arn}`);
                   const data = await res.json();
-                  return { ...exec, status: data.status };
+                  return { ...exec, status: data.status || exec.status };
                 } catch (e) {
                   console.error(`Error fetching status for child ${exec.keyword}:`, e);
                   return exec;
@@ -1465,25 +1711,26 @@ const Dashboard = () => {
   }
 
   return (
-    <div className="min-h-screen bg-[#32402F] text-white p-4 md:p-6">
+    <div className="min-h-screen bg-[#1a2318] text-white p-4 md:p-8">
       {/* Header */}
-      <div className="text-center mb-8">
-        <h1 className="text-2xl md:text-3xl font-medium tracking-wider">TREND RADAR</h1>
+      <div className="text-center mb-10">
+        <h1 className="text-3xl md:text-4xl font-bold tracking-[0.25em] text-white drop-shadow-lg">TREND RADAR</h1>
+        <div className="mt-2 h-0.5 w-24 bg-[#F3940B] mx-auto rounded-full opacity-80"></div>
       </div>
 
       {/* Main Content */}
       <div className="max-w-7xl mx-auto">
         {/* Top Row: Searching Filters, Location, Active Search */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8 items-center">
           {/* Left: Searching Filters */}
           <div>
-            <div className="border border-white p-2">
+            <div className="border border-white/40 bg-white/5 px-4 py-3 rounded-lg backdrop-blur-sm">
               <input
                 type="text"
                 value={searchingFilters}
                 onChange={(e) => setSearchingFilters(e.target.value)}
                 placeholder="SEARCHING FILTERS:"
-                className="w-full h-10 text-white text-lg bg-transparent border-none outline-none placeholder-gray-300 font-medium tracking-wide"
+                className="w-full h-10 text-white text-base bg-transparent border-none outline-none placeholder-gray-400 font-semibold tracking-widest"
               />
             </div>
           </div>
@@ -1491,8 +1738,8 @@ const Dashboard = () => {
           {/* Center: Location */}
           <div className="flex flex-col items-center justify-center gap-2">
             <div className="flex items-center gap-4">
-              <label className="text-sm font-medium flex items-center">
-                LOCATION: <span className="text-red-400">*</span>
+              <label className="text-xs font-bold tracking-widest text-gray-300 uppercase flex items-center">
+                LOCATION: <span className="text-[#F3940B] ml-0.5">*</span>
               </label>
               <select
                 value={location}
@@ -1503,8 +1750,9 @@ const Dashboard = () => {
                     setLocationError('');
                   }
                 }}
-                className={`px-3 py-2 text-white bg-[#32402F] border focus:outline-none focus:border-blue-500 ${locationError ? 'border-red-500' : 'border-white'
-                  } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                className={`px-4 py-2 text-white bg-[#2a3828] border rounded-lg focus:outline-none focus:border-[#F3940B] transition-colors ${
+                  locationError ? 'border-red-500' : 'border-white/40'
+                } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
               >
                 <option value="">Select a country</option>
                 {countries.map((country) => (
@@ -1536,36 +1784,39 @@ const Dashboard = () => {
         </div>
 
         {/* Combined Row: Searching Mode + Search Fields (Left) and Blacklisted Words (Right) */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <div className="bg-[#243022] border border-white/10 rounded-xl p-6 mb-6 shadow-xl">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Left: Searching Mode + Search Fields in 2x2 grid */}
-          <div className="lg:col-span-2 space-y-4">
+          <div className="lg:col-span-2 space-y-5">
             {/* Searching Mode - All in one line */}
-            <div className="flex items-center gap-6">
-              <span className="text-sm font-medium">SEARCHING MODE:</span>
+            <div className="flex items-center gap-5 flex-wrap">
+              <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">SEARCHING MODE:</span>
               {['MANUAL', 'CATEGORY BASED', 'ATAI AUTO'].map((mode) => (
-                <label key={mode} className="flex items-center gap-2">
-                  <span className="text-sm">{mode}</span>
+                <label key={mode} className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="radio"
                     name="searchingMode"
                     value={mode}
                     checked={searchingMode === mode}
                     onChange={(e) => setSearchingMode(e.target.value)}
-                    className="w-4 h-4 text-[#F3940B] bg-gray-700 border-gray-600 focus:ring-[#F3940B]"
-                    style={{
-                      accentColor: '#F3940B'
-                    }}
+                    className="sr-only"
+                    style={{ accentColor: '#F3940B' }}
                   />
+                  <span className={`px-3 py-1 text-xs font-bold tracking-wider rounded-full border transition-all ${
+                    searchingMode === mode
+                      ? 'bg-[#F3940B] border-[#F3940B] text-black shadow-lg shadow-orange-900/40'
+                      : 'border-white/30 text-gray-300 hover:border-white/60 hover:text-white'
+                  }`}>{mode}</span>
                 </label>
               ))}
             </div>
 
             {/* Search Fields in 2x2 grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
               {searchingMode === 'MANUAL' ? (
                 <div>
-                  <label className="block text-sm font-medium mb-2 flex items-center">
-                    KEYWORD SEARCH <span className="text-red-400">*</span>
+                  <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
+                    KEYWORD SEARCH <span className="text-[#F3940B] ml-0.5">*</span>
                   </label>
                   <input
                     type="text"
@@ -1577,8 +1828,9 @@ const Dashboard = () => {
                         setKeywordSearchError('');
                       }
                     }}
-                    className={`w-full px-3 py-2 text-black bg-[#FFFFFF] border focus:outline-none focus:border-blue-500 ${keywordSearchError ? 'border-red-500' : 'border-gray-600'
-                      } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${
+                      keywordSearchError ? 'border-red-500' : 'border-gray-300'
+                    } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                   />
                   {keywordSearchError && (
                     <p className="text-red-400 text-xs mt-1">{keywordSearchError}</p>
@@ -1586,11 +1838,11 @@ const Dashboard = () => {
                 </div>
               ) : (
                 <div className="flex flex-col gap-2">
-                  <label className="text-sm font-medium">PRODUCT CATEGORY <span className="text-red-400">*</span></label>
+                  <label className="text-xs font-bold tracking-widest text-gray-400 uppercase">PRODUCT CATEGORY <span className="text-[#F3940B]">*</span></label>
                   <select
                     value={productCategory}
                     onChange={(e) => setProductCategory(e.target.value)}
-                    className="w-full px-3 py-2 text-black bg-white border border-gray-300 focus:outline-none focus:border-blue-500"
+                    className="w-full px-4 py-2.5 text-black bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40"
                   >
                     {GT_CATEGORIES.map((cat) => (
                       <option key={cat} value={cat}>{cat}</option>
@@ -1602,16 +1854,17 @@ const Dashboard = () => {
               {activeSearch && (
                 <div className="flex flex-col items-start gap-2 relative">
                   <div className="flex items-center gap-4 flex-col">
-                    <span className="text-sm font-medium flex items-center">
-                      TREND PERIOD <span className="text-red-400">*</span>
+                    <span className="text-xs font-bold tracking-widest text-gray-400 uppercase flex items-center">
+                      TREND PERIOD <span className="text-[#F3940B] ml-0.5">*</span>
                       {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
                     </span>
                     <div className="relative trend-dropdown">
                       <button
                         onClick={() => !pipelineFieldsDisabled && setShowTrendDropdown(!showTrendDropdown)}
                         disabled={pipelineFieldsDisabled}
-                        className={`px-3 py-2 text-black bg-white border focus:outline-none focus:border-blue-500 min-w-[150px] flex items-center justify-between ${trendPeriodError ? 'border-red-500' : 'border-gray-300'
-                          } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        className={`px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 min-w-[150px] flex items-center justify-between ${
+                          trendPeriodError ? 'border-red-500' : 'border-gray-300'
+                        } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                       >
                         <span>{trendPeriod || 'Select period'}</span>
                         <span className="ml-2">▼</span>
@@ -1647,8 +1900,8 @@ const Dashboard = () => {
               {activeSearch && (
                 <>
                   <div>
-                    <label className="block text-sm font-medium mb-2 flex items-center">
-                      VARIANT LIMIT MAX <span className="text-red-400">*</span>
+                    <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
+                      VARIANT LIMIT MAX <span className="text-[#F3940B] ml-0.5">*</span>
                       {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
                     </label>
                     <input
@@ -1661,16 +1914,17 @@ const Dashboard = () => {
                           setVariantLimitMaxError('');
                         }
                       }}
-                      className={`w-full px-3 py-2 text-black bg-[#FFFFFF] border focus:outline-none focus:border-blue-500 ${variantLimitMaxError ? 'border-red-500' : 'border-gray-600'
-                        } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${
+                        variantLimitMaxError ? 'border-red-500' : 'border-gray-300'
+                      } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                     />
                     {variantLimitMaxError && (
                       <p className="text-red-400 text-xs mt-1">{variantLimitMaxError}</p>
                     )}
                   </div>
                   <div>
-                    <label className="block text-sm font-medium mb-2 flex items-center">
-                      RESULTS CAP MAX <span className="text-red-400">*</span>
+                    <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
+                      RESULTS CAP MAX <span className="text-[#F3940B] ml-0.5">*</span>
                       {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
                     </label>
                     <input
@@ -1683,8 +1937,9 @@ const Dashboard = () => {
                           setResultsCapError('');
                         }
                       }}
-                      className={`w-full px-3 py-2 text-black bg-[#FFFFFF] border focus:outline-none focus:border-blue-500 ${resultsCapError ? 'border-red-500' : 'border-gray-600'
-                        } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${
+                        resultsCapError ? 'border-red-500' : 'border-gray-300'
+                      } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                     />
                     {resultsCapError && (
                       <p className="text-red-400 text-xs mt-1">{resultsCapError}</p>
@@ -1697,7 +1952,7 @@ const Dashboard = () => {
 
           {/* Right: Blacklisted Words */}
           <div>
-            <label className="block text-sm font-medium mb-2">BLACKLISTED WORDS</label>
+            <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2">BLACKLISTED WORDS</label>
             <div 
               className="flex flex-col w-full h-32 bg-[#FFFFFF] border border-gray-600 focus-within:border-blue-500 overflow-hidden cursor-text"
               onClick={() => document.getElementById('blacklist-input')?.focus()}
@@ -1761,13 +2016,15 @@ const Dashboard = () => {
               </div>
             </div>
           </div>
+          </div>
         </div>
 
-        {/* Fourth Row: Google Trend Score, Product Category, Trend Period */}
-        <div className="flex flex-wrap items-center gap-8 lg:gap-12 mb-6">
+        {/* Fourth Row: Google Trend Score, KWP Monthly Searches */}
+        <div className="bg-[#243022] border border-white/10 rounded-xl px-6 py-5 mb-6 shadow-lg">
+          <div className="flex flex-wrap items-center gap-8 lg:gap-14">
           {/* Google Trend Score */}
           <div className="flex items-center gap-4">
-            <span className="text-sm font-medium">GOOGLE TREND SCORE</span>
+            <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">GOOGLE TREND SCORE</span>
             <div className="h-5 flex items-center bg-white px-3 py-2 ">
               <svg width="20" height="12" viewBox="0 0 20 12" className="mr-2">
                 {/* Google Trends icon */}
@@ -1823,7 +2080,7 @@ const Dashboard = () => {
             </div>
           </div>
           <div>
-            <label className="block text-sm font-medium mb-2">KWP MONTHLY SEARCHES</label>
+            <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2">KWP MONTHLY SEARCHES</label>
             <div className="flex items-center gap-2">
               <div className="flex flex-col items-start gap-1 flex-1">
                 <span className="text-xs text-gray-300">MIN</span>
@@ -1856,44 +2113,31 @@ const Dashboard = () => {
           {/* Trend Period */}
 
         </div>
+        </div>
 
         {/* Amazon Filters */}
-        <div className="mb-6">
-          <div className="flex items-center gap-4 mb-4">
-            <h3 className="text-yellow-400 font-medium">AMAZON FILTERS</h3>
-            <label className="flex items-center gap-2">
-              <span className="text-sm">ON</span>
-              <input
-                type="radio"
-                name="amazonFilters"
-                value="on"
-                checked={amazonFilters}
-                onChange={(e) => setAmazonFilters(true)}
-                className="w-4 h-4 text-[#F3940B] bg-gray-700 border-gray-600 "
-                style={{
-                  accentColor: '#F3940B'
-                }}
+        <div className="mb-5 bg-[#243022] border border-white/10 rounded-xl overflow-hidden shadow-lg">
+          <div className="flex items-center gap-5 px-6 py-4 border-l-4 border-[#F3940B]">
+            <h3 className="text-[#F3940B] font-bold tracking-wider text-sm">AMAZON FILTERS</h3>
+            {/* Toggle switch */}
+            <button
+              onClick={() => setAmazonFilters(!amazonFilters)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${
+                amazonFilters ? 'bg-[#F3940B]' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${
+                  amazonFilters ? 'translate-x-6' : 'translate-x-1'
+                }`}
               />
-            </label>
-            <label className="flex items-center gap-2">
-              <span className="text-sm">OFF</span>
-              <input
-                type="radio"
-                name="amazonFilters"
-                value="off"
-                checked={!amazonFilters}
-                onChange={(e) => setAmazonFilters(false)}
-                className="w-4 h-4 text-[#F3940B] bg-gray-700 border-gray-600 "
-                style={{
-                  accentColor: '#F3940B'
-                }}
-              />
-            </label>
+            </button>
+            <span className="text-xs font-bold tracking-widest text-gray-400">{amazonFilters ? 'ON' : 'OFF'}</span>
           </div>
 
-          <div className={`flex flex-wrap items-center gap-6 lg:gap-8 ${!amazonFilters ? 'opacity-50 pointer-events-none' : ''}`}>
-            <div className="flex items-center gap-4">
-              <span className={`text-sm font-medium ${!amazonFilters ? 'text-gray-400' : ''}`}>PRICE FILTER</span>
+          <div className={`px-6 pt-2 pb-5 flex flex-wrap items-center gap-6 lg:gap-10 ${!amazonFilters ? 'opacity-40 pointer-events-none' : ''}`}>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!amazonFilters ? 'text-gray-500' : 'text-gray-300'}`}>PRICE FILTER</span>
               <div className="flex items-center gap-2">
                 <span className={`text-sm ${!amazonFilters ? 'text-gray-400' : ''}`}>MIN</span>
                 <input
@@ -1920,8 +2164,8 @@ const Dashboard = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
-              <span className={`text-sm font-medium ${!amazonFilters ? 'text-gray-400' : ''}`}>REVIEWS</span>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!amazonFilters ? 'text-gray-500' : 'text-gray-300'}`}>REVIEWS</span>
               <div className="flex items-center gap-2">
                 <span className={`text-sm ${!amazonFilters ? 'text-gray-400' : ''}`}>MIN</span>
                 <input
@@ -1948,8 +2192,8 @@ const Dashboard = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
-              <span className={`text-sm ${!amazonFilters ? 'text-gray-400' : ''}`}>RATING FILTER ▼</span>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!amazonFilters ? 'text-gray-500' : 'text-gray-300'}`}>RATING FILTER ▼</span>
               <div className="flex gap-1">
                 {[1, 2, 3, 4, 5].map((star) => (
                   <span
@@ -1976,8 +2220,8 @@ const Dashboard = () => {
               )}
             </div>
 
-            <div className="flex items-center gap-4">
-              <span className={`text-sm ${!amazonFilters ? 'text-gray-400' : ''}`}>FCL</span>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!amazonFilters ? 'text-gray-500' : 'text-gray-300'}`}>FCL</span>
               <div className={`px-3 py-1 flex items-center gap-2 ${!amazonFilters ? 'bg-gray-300' : 'bg-white'}`}>
                 <input
                   type="range"
@@ -2027,42 +2271,27 @@ const Dashboard = () => {
         </div>
 
         {/* Alibaba Filters */}
-        <div className="mb-8">
-          <div className="flex items-center gap-4 mb-4">
-            <h3 className="text-yellow-400 font-medium">ALIBABA SUPPLIER FILTERS</h3>
-            <label className="flex items-center gap-2">
-              <span className="text-sm">ON</span>
-              <input
-                type="radio"
-                name="alibabaFilters"
-                value="on"
-                checked={alibabaFilters}
-                onChange={(e) => setAlibabaFilters(true)}
-                className="w-4 h-4 text-[#F3940B] bg-gray-700 border-gray-600"
-                style={{
-                  accentColor: '#F3940B'
-                }}
+        <div className="mb-8 bg-[#243022] border border-white/10 rounded-xl overflow-hidden shadow-lg">
+          <div className="flex items-center gap-5 px-6 py-4 border-l-4 border-blue-500">
+            <h3 className="text-blue-400 font-bold tracking-wider text-sm">ALIBABA SUPPLIER FILTERS</h3>
+            {/* Toggle switch */}
+            <button
+              onClick={() => setAlibabaFilters(!alibabaFilters)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${
+                alibabaFilters ? 'bg-blue-500' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${
+                  alibabaFilters ? 'translate-x-6' : 'translate-x-1'
+                }`}
               />
-            </label>
-            <label className="flex items-center gap-2">
-              <span className="text-sm">OFF</span>
-              <input
-                type="radio"
-                name="alibabaFilters"
-                value="off"
-                checked={!alibabaFilters}
-                onChange={(e) => setAlibabaFilters(false)}
-                className="w-4 h-4 text-[#F3940B] bg-gray-700 border-gray-600"
-                style={{
-                  accentColor: '#F3940B'
-                }}
-              />
-            </label>
+            </button>
+            <span className="text-xs font-bold tracking-widest text-gray-400">{alibabaFilters ? 'ON' : 'OFF'}</span>
           </div>
-
-          <div className={`flex flex-wrap items-center gap-6 lg:gap-8 ${!alibabaFilters ? 'opacity-50 pointer-events-none' : ''}`}>
-            <div className="flex items-center gap-4">
-              <span className={`text-sm ${!alibabaFilters ? 'text-gray-400' : ''}`}>COST BELOW %</span>
+          <div className={`px-6 pt-2 pb-5 flex flex-wrap items-center gap-6 lg:gap-10 ${!alibabaFilters ? 'opacity-40 pointer-events-none' : ''}`}>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!alibabaFilters ? 'text-gray-500' : 'text-gray-300'}`}>COST BELOW %</span>
               <div className={`px-3 py-1 flex items-center gap-2 ${!alibabaFilters ? 'bg-gray-300' : 'bg-white'}`}>
                 <input
                   type="range"
@@ -2109,8 +2338,8 @@ const Dashboard = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
-              <span className={`text-sm ${!alibabaFilters ? 'text-gray-400' : ''}`}>MOQ</span>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!alibabaFilters ? 'text-gray-500' : 'text-gray-300'}`}>MOQ</span>
               <input
                 type="text"
                 value={moq}
@@ -2123,8 +2352,8 @@ const Dashboard = () => {
               />
             </div>
 
-            <div className="flex items-center gap-4">
-              <span className={`text-sm ${!alibabaFilters ? 'text-gray-400' : ''}`}>RATING FILTER ▼</span>
+            <div className="flex items-center gap-3">
+              <span className={`text-xs font-bold tracking-widest uppercase ${!alibabaFilters ? 'text-gray-500' : 'text-gray-300'}`}>RATING FILTER ▼</span>
               <div className="flex gap-1">
                 {[1, 2, 3, 4, 5].map((star) => (
                   <span
@@ -2151,8 +2380,8 @@ const Dashboard = () => {
               )}
             </div>
 
-            <div className={`flex items-center gap-2 px-3 py-1 ${!alibabaFilters ? 'bg-gray-300' : 'bg-white'}`}>
-              <span className={`text-sm font-medium ${!alibabaFilters ? 'text-gray-500' : 'text-gray-800'}`}>Verified Supplier:</span>
+            <div className={`flex items-center gap-3 px-3 py-1.5 rounded-lg ${!alibabaFilters ? 'bg-gray-700/30' : 'bg-white/10'}`}>
+              <span className={`text-xs font-bold tracking-widest uppercase ${!alibabaFilters ? 'text-gray-500' : 'text-gray-300'}`}>Verified Supplier:</span>
               <div className="flex items-center gap-2">
                 <button
                   onClick={alibabaFilters ? () => setVerifiedSupplier(!verifiedSupplier) : undefined}
@@ -2177,50 +2406,122 @@ const Dashboard = () => {
           </div>
         </div>
 
-        {/* Bottom Controls */}
-        <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
-          <select
-            value={savePreset}
-            onChange={(e) => setSavePreset(e.target.value)}
-            className="px-4 py-2 text-white bg-[#32402F] border border-white focus:outline-none focus:border-blue-500"
-          >
-            <option value="SAVE PRESET 1">SAVE PRESET 1</option>
-            <option value="SAVE PRESET 2">SAVE PRESET 2</option>
-            <option value="SAVE PRESET 3">SAVE PRESET 3</option>
-          </select>
+        {/* ── Preset System + Bottom Action Bar ─────────────────────────── */}
+        <div className="flex flex-col sm:flex-row gap-3 justify-center items-center mt-4">
+
+          {/* Preset dropdown button */}
+          <div className="relative">
+            <button
+              onClick={() => setPresetDropdownOpen(o => !o)}
+              className="flex items-center gap-2 px-4 py-2.5 bg-[#243022] border border-white/20 text-white text-sm font-semibold rounded-lg hover:border-white/50 transition-colors"
+            >
+              {presetSaveFlash
+                ? <span className="text-green-400">✓ SAVED</span>
+                : selectedPresetId !== null && presets.find(p => p.id === selectedPresetId)
+                  ? presets.find(p => p.id === selectedPresetId)!.name
+                  : 'PRESETS'}
+              <svg className={`w-3 h-3 transition-transform ${presetDropdownOpen ? 'rotate-180' : ''}`} fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+              </svg>
+            </button>
+
+            {presetDropdownOpen && (
+              <div className="absolute bottom-full mb-2 left-0 z-50 bg-[#1a2318] border border-white/20 rounded-xl shadow-2xl min-w-[260px] overflow-hidden">
+                {/* Preset list */}
+                {presets.length === 0 ? (
+                  <div className="px-4 py-3 text-sm text-gray-400 text-center">No presets saved yet.</div>
+                ) : (
+                  <div className="flex flex-col">
+                    {presets.map((p) => (
+                      <div key={p.id} className={`flex items-center gap-1 px-3 py-2 border-b border-white/5 hover:bg-white/5 ${selectedPresetId === p.id ? 'bg-white/10' : ''}`}>
+                        {/* Name / rename input */}
+                        {editingPresetId === p.id ? (
+                          <input
+                            autoFocus
+                            type="text"
+                            value={presetNameInput}
+                            onChange={(e) => setPresetNameInput(e.target.value)}
+                            onBlur={() => handleRenamePreset(p.id, presetNameInput)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleRenamePreset(p.id, presetNameInput);
+                              if (e.key === 'Escape') setEditingPresetId(null);
+                            }}
+                            className="flex-1 px-2 py-0.5 text-black bg-white text-sm rounded focus:outline-none"
+                          />
+                        ) : (
+                          <button
+                            onClick={() => setSelectedPresetId(p.id)}
+                            className="flex-1 text-left text-sm text-white truncate"
+                          >
+                            {p.name}
+                          </button>
+                        )}
+                        {/* Icon buttons */}
+                        <button
+                          title="Load"
+                          onClick={() => { setSelectedPresetId(p.id); handleLoadPreset(); setPresetDropdownOpen(false); }}
+                          className="shrink-0 px-2 py-0.5 text-xs text-[#C0FE72] border border-[#C0FE72]/40 rounded hover:bg-[#C0FE72]/10 transition-colors"
+                        >⬆ LOAD</button>
+                        <button
+                          title="Rename"
+                          onClick={() => { setPresetNameInput(p.name); setEditingPresetId(p.id); }}
+                          className="shrink-0 px-2 py-0.5 text-xs text-gray-300 border border-white/20 rounded hover:bg-white/10 transition-colors"
+                        >✎</button>
+                        <button
+                          title="Delete"
+                          onClick={() => handleDeletePreset(p.id)}
+                          className="shrink-0 px-2 py-0.5 text-xs text-red-400 border border-red-500/30 rounded hover:bg-red-500/10 transition-colors"
+                        >🗑</button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* Save new preset */}
+                <div className="px-3 py-2">
+                  <button
+                    onClick={() => { handleSaveNewPreset(); setPresetDropdownOpen(false); }}
+                    className="w-full py-2 text-xs font-bold tracking-widest text-[#1a2318] bg-[#C0FE72] rounded-lg hover:bg-[#d4ff8a] transition-colors"
+                  >
+                    💾 SAVE NEW PRESET
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
 
           <button
             onClick={handleReset}
-            className="px-6 py-2 bg-[#32402F] text-white  hover:bg-gray-500 transition-colors border border-[#ffffff]"
+            className="px-6 py-2.5 bg-transparent text-white font-semibold tracking-wider border border-white/50 rounded-lg hover:bg-white/10 transition-colors text-sm"
           >
-            RESET
+            ↺ RESET
           </button>
 
           <button
             onClick={handleExportCsv}
             disabled={pipelineStatus !== 'COMPLETED'}
-            className={`px-8 py-2 rounded font-bold transition-colors ${pipelineStatus === 'COMPLETED'
-              ? 'bg-blue-500 text-black hover:bg-blue-400'
-              : 'bg-gray-600 text-gray-300 cursor-not-allowed'
-              }`}
+            className={`px-7 py-2.5 rounded-lg font-bold tracking-wide transition-all text-sm ${
+              pipelineStatus === 'COMPLETED'
+                ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/40'
+                : 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
+            }`}
           >
-            EXPORT CSV
+            ⬇ EXPORT CSV
           </button>
 
           <button
             onClick={handleSearch}
             disabled={isLoading}
-            className="px-8 py-2 bg-yellow-500 text-white font-bold rounded hover:bg-yellow-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-10 py-2.5 bg-[#F3940B] text-black font-bold tracking-wider rounded-lg hover:bg-[#e8860a] transition-all shadow-lg shadow-orange-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
           >
-            {isLoading ? 'SEARCHING...' : 'SEARCH'}
+            {isLoading ? '⟳ SEARCHING...' : '⬛ SEARCH'}
           </button>
 
           <button
             onClick={handleStopSearch}
             disabled={!executionArn || pipelineStatus !== 'POLLING'}
-            className="px-6 py-2 bg-red-600 text-black font-bold rounded hover:bg-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-7 py-2.5 bg-red-700 text-white font-bold tracking-wide rounded-lg hover:bg-red-600 transition-all shadow-lg shadow-red-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
           >
-            STOP CURRENT SEARCH
+            ✕ STOP CURRENT SEARCH
           </button>
         </div>
 
