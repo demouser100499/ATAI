@@ -21,7 +21,8 @@ export async function POST(request: NextRequest) {
     sameSite: 'lax',
     path: '/',
     maxAge: 60 * 60 * 24 * 7, // 7 days
-    secure: process.env.NODE_ENV === 'production',
+    // Note: 'secure' is intentionally omitted — the app runs over HTTP on EC2.
+    // If you add HTTPS/SSL in future, add: secure: true
   });
 
   return response;
