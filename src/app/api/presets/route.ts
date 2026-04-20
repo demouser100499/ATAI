@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { logger } from '@/lib/logger';
 
 const DATA_DIR = join(process.cwd(), 'data');
 const PRESETS_FILE = join(DATA_DIR, 'presets.json');
@@ -61,21 +62,23 @@ export async function POST(request: NextRequest) {
 
     if (body.action === 'save_new') {
       const nextCounter = store.counter + 1;
-      
+
       let nextPresetNum = 1;
       const existingNames = new Set(store.list.map(p => p.name));
       while (existingNames.has(`Preset ${nextPresetNum}`)) {
         nextPresetNum++;
       }
 
+      const name = body.name || `Preset ${nextPresetNum}`;
       const newPreset: PresetSlot = {
         id: nextCounter,
-        name: `Preset ${nextPresetNum}`,
+        name,
         data: body.data,
       };
       store.list.push(newPreset);
       store.counter = nextCounter;
       writeStore(store);
+      logger.info(`Preset saved | Name: "${name}" | ID: ${nextCounter}`);
       return NextResponse.json({ success: true, preset: newPreset, counter: nextCounter });
     }
 
@@ -83,11 +86,13 @@ export async function POST(request: NextRequest) {
       const { id, name } = body;
       store.list = store.list.map((p) => (p.id === id ? { ...p, name } : p));
       writeStore(store);
+      logger.info(`Preset renamed | ID: ${id} | New name: "${name}"`);
       return NextResponse.json({ success: true });
     }
 
     return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
   } catch (e) {
+    logger.error('Presets POST Error', e);
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
 }
@@ -99,8 +104,10 @@ export async function DELETE(request: NextRequest) {
     const store = readStore();
     store.list = store.list.filter((p) => p.id !== id);
     writeStore(store);
+    logger.info(`Preset deleted | ID: ${id}`);
     return NextResponse.json({ success: true });
   } catch (e) {
+    logger.error('Presets DELETE Error', e);
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
 }
