@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import { fetchProducts, Product } from '@/lib/productsService';
 
@@ -61,6 +61,8 @@ const Dashboard = () => {
     setIsClient(true);
   }, []);
 
+
+
   // Countries with geo codes
   const [searchingFilters, setSearchingFilters] = useState('');
   const [location, setLocation] = useState('');
@@ -92,6 +94,8 @@ const Dashboard = () => {
 
   // ── Preset system (dynamic — starts empty) ───────────────────────────────
   type PresetData = {
+    searchingMode?: string;
+    productCategory?: string;
     location: string;
     trendPeriod: string;
     variantLimitMax: string;
@@ -124,6 +128,25 @@ const Dashboard = () => {
 
   // Load presets from server on mount (shared across all users)
   const [presetDropdownOpen, setPresetDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      // Don't close if we are actively editing a name or if the click is inside the dropdown
+      if (editingPresetId !== null) return;
+      
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setPresetDropdownOpen(false);
+        setIsCreatingNewPreset(false);
+      }
+    }
+    if (presetDropdownOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [presetDropdownOpen, editingPresetId]);
 
   useEffect(() => {
     fetch('/api/presets')
@@ -137,6 +160,8 @@ const Dashboard = () => {
   }, []);
 
   const getFiltersSnapshot = useCallback((): PresetData => ({
+    searchingMode,
+    productCategory,
     location,
     trendPeriod,
     variantLimitMax,
@@ -157,18 +182,18 @@ const Dashboard = () => {
     moq,
     alibabaRating,
     verifiedSupplier,
-  }), [location, trendPeriod, variantLimitMax, resultsCap, kwpMinSearches, kwpMaxSearches,
+  }), [searchingMode, productCategory, location, trendPeriod, variantLimitMax, resultsCap, kwpMinSearches, kwpMaxSearches,
     blacklistedWords, googleTrendScore, amazonFilters, priceMin, priceMax, reviewsMin, reviewsMax,
     ratingFilter, fcl, alibabaFilters, costBelow, moq, alibabaRating, verifiedSupplier]);
 
   // Save current filters as a brand-new preset slot (server-side)
-  const handleSaveNewPreset = useCallback(async () => {
+  const handleSaveNewPreset = useCallback(async (customName?: string) => {
     const data = getFiltersSnapshot();
     try {
       const res = await fetch('/api/presets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'save_new', data }),
+        body: JSON.stringify({ action: 'save_new', name: customName, data }),
       });
       const result = await res.json();
       if (result.success) {
@@ -183,10 +208,19 @@ const Dashboard = () => {
     }
   }, [getFiltersSnapshot]);
 
-  const handleLoadPreset = useCallback(() => {
-    const slot = presets.find(p => p.id === selectedPresetId);
+  const handleLoadPreset = useCallback((idToLoad?: number) => {
+    const targetId = idToLoad !== undefined ? idToLoad : selectedPresetId;
+    const slot = presets.find(p => p.id === targetId);
     if (!slot) return;
     const d = slot.data;
+    // Signal the searchingMode effect to skip its reset on this mode change
+    isLoadingPresetRef.current = true;
+    
+    // Safety reset to ensure the ref doesn't stick if searchingMode is identical
+    setTimeout(() => { isLoadingPresetRef.current = false; }, 100);
+
+    if (d.searchingMode) setSearchingMode(d.searchingMode);
+    if (d.productCategory) setProductCategory(d.productCategory);
     setLocation(d.location ?? '');
     setTrendPeriod(d.trendPeriod ?? '');
     setVariantLimitMax(d.variantLimitMax ?? '');
@@ -250,14 +284,22 @@ const Dashboard = () => {
   const [error, setError] = useState<string | null>(null);
 
   // Pipeline State
+  const cancelTokenRef = useRef(false);
+  // Flag to prevent the searchingMode cleanup effect from resetting filters during preset loads
+  const isLoadingPresetRef = useRef(false);
   const [pipelineStatus, setPipelineStatus] = useState<'IDLE' | 'STARTING' | 'POLLING' | 'COMPLETED' | 'FAILED'>('IDLE');
   const [executionArn, setExecutionArn] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [pollingIntervalRef, setPollingIntervalRef] = useState<NodeJS.Timeout | null>(null);
+  const [isBatching, setIsBatching] = useState(false); // Tracking sequential category trigger phase
   const [isPreliminary, setIsPreliminary] = useState(false);
   const [hasPerformedSearch, setHasPerformedSearch] = useState(false);
   const [consolidatedResults, setConsolidatedResults] = useState<any[]>([]);
   const [categoryExecutions, setCategoryExecutions] = useState<{ keyword: string, run_id: string, execution_arn: string, status?: string }[]>([]);
+  const categoryExecutionsRef = useRef(categoryExecutions);
+  useEffect(() => {
+    categoryExecutionsRef.current = categoryExecutions;
+  }, [categoryExecutions]);
   // Category test mode: keywords from Google Trends only (no pipeline trigger)
   const [categoryKeywordsPreview, setCategoryKeywordsPreview] = useState<string[] | null>(null);
   // Remember the core search context used for the last executed run.
@@ -272,6 +314,12 @@ const Dashboard = () => {
 
   // Per-product expansion for nested stage specifications within the main table
   const [expandedProductId, setExpandedProductId] = useState<string | null>(null);
+
+  // Consolidated table row selection for easy horizontal scrolling tracking
+  const [selectedRowIndex, setSelectedRowIndex] = useState<number | null>(null);
+
+  const [isCreatingNewPreset, setIsCreatingNewPreset] = useState(false);
+  const [newPresetNameInput, setNewPresetNameInput] = useState('');
 
   // For CATEGORY BASED mode: currently selected category variant keyword filter
   const [selectedCategoryVariant, setSelectedCategoryVariant] = useState<string>('ALL');
@@ -303,6 +351,59 @@ const Dashboard = () => {
   const [alibabaResults, setAlibabaResults] = useState<any[] | null>(null);
   const [alibabaMeta, setAlibabaMeta] = useState<{ message?: string; rows?: number } | null>(null);
   const [hasLoadedAlibaba, setHasLoadedAlibaba] = useState(false);
+
+  // ── Floating horizontal scrollbar logic ────────────────────────────────
+  const mainTableScrollRef = useRef<HTMLDivElement>(null);
+  const stickyScrollContainerRef = useRef<HTMLDivElement>(null);
+  const stickyScrollContentRef = useRef<HTMLDivElement>(null);
+  const [showStickyScroll, setShowStickyScroll] = useState(false);
+
+  const handleMainTableScroll = () => {
+    if (stickyScrollContainerRef.current && mainTableScrollRef.current) {
+      stickyScrollContainerRef.current.scrollLeft = mainTableScrollRef.current.scrollLeft;
+    }
+  };
+  const handleStickyScroll = () => {
+    if (mainTableScrollRef.current && stickyScrollContainerRef.current) {
+      mainTableScrollRef.current.scrollLeft = stickyScrollContainerRef.current.scrollLeft;
+    }
+  };
+
+  useEffect(() => {
+    if (!isClient) return;
+
+    const handleScrollAndResize = () => {
+      if (!mainTableScrollRef.current || !stickyScrollContentRef.current || !stickyScrollContainerRef.current) return;
+      const rect = mainTableScrollRef.current.getBoundingClientRect();
+      const viewportHeight = window.innerHeight;
+
+      // Sync the width of the fake content to the real table scroll width
+      stickyScrollContentRef.current.style.width = `${mainTableScrollRef.current.scrollWidth}px`;
+
+      // Show the sticky scrollbar if the top of the table is visible AND the bottom is offscreen
+      const isTopVisible = rect.top < viewportHeight;
+      const isBottomOffscreen = rect.bottom > viewportHeight;
+
+      setShowStickyScroll(isTopVisible && isBottomOffscreen);
+    };
+
+    window.addEventListener('scroll', handleScrollAndResize, { passive: true });
+    window.addEventListener('resize', handleScrollAndResize, { passive: true });
+
+    const observer = new MutationObserver(handleScrollAndResize);
+    if (mainTableScrollRef.current) {
+      observer.observe(mainTableScrollRef.current, { childList: true, subtree: true });
+    }
+
+    handleScrollAndResize();
+
+    return () => {
+      window.removeEventListener('scroll', handleScrollAndResize);
+      window.removeEventListener('resize', handleScrollAndResize);
+      observer.disconnect();
+    };
+  }, [isClient, consolidatedResults, pipelineStatus]);
+  // ────────────────────────────────────────────────────────────────────────
 
   // Check if fields should be disabled (after successful pipeline completion)
   // KEYWORD SEARCH and LOCATION should remain enabled
@@ -469,8 +570,16 @@ const Dashboard = () => {
     };
   }, [showTrendDropdown]);
 
-  // Clear results and filters when searching mode changes
+  // Clear results and filters when searching mode changes.
+  // Skipped when a preset is being loaded (isLoadingPresetRef) so the preset
+  // values are not wiped out immediately after being applied.
   useEffect(() => {
+    if (isLoadingPresetRef.current) {
+      // A preset load just changed the mode — let the preset values stand.
+      isLoadingPresetRef.current = false;
+      return;
+    }
+
     // Clear Results & Status
     setProducts([]);
     setError(null);
@@ -676,44 +785,88 @@ const Dashboard = () => {
     const seedRows: any[] = kwpRows.length > 0 ? kwpRows : amzRows;
     if (seedRows.length === 0) return;
 
-    // Fuzzy join helper — handles the root-keyword vs KWP-variant mismatch.
-    // Amazon/Alibaba are fetched with the ROOT keyword ("earphones") while KWP
-    // produces VARIANTS ("audio headphones", "bose ear buds", etc.).
-    // Priority: 1) exact match  2) bidirectional inclusion  3) title-word overlap  4) first-row fallback
-    const matchFuzzy = (arr: any[], kwpKw: string, kwFields: string[], titleField?: string): any | null => {
+    // ── Scoped grouping ─────────────────────────────────────────────────────
+    // In category mode every child execution sets a shared `keyword` field on
+    // every Amazon/Alibaba row (= the execution root keyword, e.g. "portable mp3 player").
+    // KWP variant rows carry `root_keyword` pointing to the same root.
+    // We group marketplace rows by that root keyword so each KWP variant is matched
+    // ONLY against products from its own execution — preventing the old arr[0]
+    // fallback from bleeding a random cross-execution product into every unmatched row.
+    const groupByExecKw = (rows: any[]): Map<string, any[]> => {
+      const m = new Map<string, any[]>();
+      for (const r of rows) {
+        const key = (r.keyword ?? r.search_category ?? '').toString().toLowerCase().trim();
+        if (!key) continue;
+        if (!m.has(key)) m.set(key, []);
+        m.get(key)!.push(r);
+      }
+      return m;
+    };
+    const amzByExecKw = groupByExecKw(amzRows);
+    const aliByExecKw = groupByExecKw(aliRows);
+
+    // ── Fuzzy join helper ─────────────────────────────────────────────────
+    // Priority: 1) exact match  2) bidirectional substring  3) title-word overlap
+    // scopedFirst: preferred subset (marketplace rows for the same execution).
+    // Returns null — never falls back to arr[0] — so unmatched rows show "-"
+    // instead of a misleading product from a completely different execution.
+    const matchFuzzy = (
+      arr: any[],
+      kwpKw: string,
+      kwFields: string[],
+      titleField?: string,
+      scopedFirst?: any[]
+    ): any | null => {
       if (!arr.length) return null;
-      if (!kwpKw) return arr[0] ?? null;
-      const kw = kwpKw.toLowerCase().trim();
+      const kw = kwpKw ? kwpKw.toLowerCase().trim() : '';
       const kwWords = kw.split(/\s+/).filter((w) => w.length > 2);
 
-      // 1. Exact keyword match (works for Google Trends which uses KWP variants directly)
-      const exact = arr.find((r) =>
-        kwFields.some((f) => (r[f] ?? '').toString().toLowerCase() === kw)
-      );
-      if (exact) return exact;
+      const trySet = (rows: any[]): any | null => {
+        if (!rows.length) return null;
 
-      // 2. Bidirectional inclusion: Amazon kw ⊂ KWP kw, or KWP kw ⊂ Amazon kw
-      //    e.g. Amazon kw="earphones", KWP kw="bose earphones" → "earphones" ⊂ KWP kw  ✓
-      const bidir = arr.find((r) =>
-        kwFields.some((f) => {
-          const val = (r[f] ?? '').toString().toLowerCase();
-          return val && (kw.includes(val) || val.includes(kw));
-        })
-      );
-      if (bidir) return bidir;
+        // 1. If we have a title to match against, prioritize the BEST title overlap!
+        if (titleField && kwWords.length > 0) {
+          let bestMatch = null;
+          let bestScore = 0;
+          for (const r of rows) {
+            const title = (r[titleField] ?? '').toString().toLowerCase();
+            const hits = kwWords.filter((w) => title.includes(w)).length;
+            if (hits >= Math.ceil(kwWords.length * 0.4) && hits > bestScore) {
+              bestScore = hits;
+              bestMatch = r;
+            }
+          }
+          if (bestMatch) return bestMatch;
+        }
 
-      // 3. Title-word overlap: ≥50% of KWP keyword words appear in product title
-      if (titleField && kwWords.length > 0) {
-        const titleMatch = arr.find((r) => {
-          const title = (r[titleField] ?? '').toString().toLowerCase();
-          const hits = kwWords.filter((w) => title.includes(w)).length;
-          return hits >= Math.ceil(kwWords.length * 0.5);
-        });
-        if (titleMatch) return titleMatch;
+        // 2. Exact keyword match
+        const exact = rows.find((r) =>
+          kwFields.some((f) => (r[f] ?? '').toString().toLowerCase() === kw)
+        );
+        if (exact) return exact;
+
+        // 3. Bidirectional inclusion (loose fallback for KWP/Trends without titles)
+        if (!titleField) {
+          const bidir = rows.find((r) =>
+            kwFields.some((f) => {
+              const val = (r[f] ?? '').toString().toLowerCase();
+              return val && (kw.includes(val) || val.includes(kw));
+            })
+          );
+          if (bidir) return bidir;
+        }
+
+        return null;
+      };
+
+      // Try scoped subset first; widen to full array only if scoped miss.
+      // Still no arr[0] blind fallback — return null if nothing genuinely matches.
+      if (scopedFirst && scopedFirst.length > 0) {
+        const scopedMatch = trySet(scopedFirst);
+        if (scopedMatch) return scopedMatch;
+        return trySet(arr);
       }
-
-      // 4. Fallback — all rows share the same root search, so any row is contextually valid
-      return arr[0] ?? null;
+      return trySet(arr);
     };
 
     // Collect all numeric values for normalisation
@@ -726,13 +879,15 @@ const Dashboard = () => {
 
     seedRows.forEach((row) => {
       const kw = (row.keyword ?? row.sub_keyword ?? row.root_keyword ?? '').toString();
-      // KWP self-match (exact, since seed is KWP)
+      // root_keyword = the execution's trigger keyword; use it to scope marketplace lookups
+      const rootKw = (row.root_keyword ?? row.keyword ?? '').toString().toLowerCase().trim();
+      const scopedAmz = amzByExecKw.get(rootKw) ?? [];
+      const scopedAli = aliByExecKw.get(rootKw) ?? [];
+
       const kwpMatch = matchFuzzy(kwpRows, kw, ['keyword', 'sub_keyword', 'root_keyword']);
-      // Trends shares KWP variants — exact match works
       const trendMatch = matchFuzzy(trendRows, kw, ['keyword']);
-      // Amazon/Alibaba use root keyword — fuzzy with title fallback
-      const amzMatch = matchFuzzy(amzRows, kw, ['keyword', 'search_category'], 'title');
-      const aliMatch = matchFuzzy(aliRows, kw, ['keyword', 'search_category'], 'title');
+      const amzMatch = matchFuzzy(amzRows, kw, ['keyword', 'search_category'], 'title', scopedAmz);
+      const aliMatch = matchFuzzy(aliRows, kw, ['keyword', 'search_category'], 'title', scopedAli);
 
       const sv = Number(kwpMatch?.avg_monthly_searches ?? row.avg_monthly_searches ?? 0);
       const tp = Number(trendMatch?.gt_interest_peak ?? trendMatch?.interest_peak ?? 0);
@@ -759,11 +914,14 @@ const Dashboard = () => {
 
     const scored = seedRows.map((row) => {
       const kw = (row.keyword ?? row.sub_keyword ?? row.root_keyword ?? '').toString();
-      // Match each source — KWP/Trends by exact variant, Amazon/Alibaba by fuzzy
+      const rootKw = (row.root_keyword ?? row.keyword ?? '').toString().toLowerCase().trim();
+      const scopedAmz = amzByExecKw.get(rootKw) ?? [];
+      const scopedAli = aliByExecKw.get(rootKw) ?? [];
+
       const kwpMatch = matchFuzzy(kwpRows, kw, ['keyword', 'sub_keyword', 'root_keyword']);
       const trendMatch = matchFuzzy(trendRows, kw, ['keyword']);
-      const amzMatch = matchFuzzy(amzRows, kw, ['keyword', 'search_category'], 'title');
-      const aliMatch = matchFuzzy(aliRows, kw, ['keyword', 'search_category'], 'title');
+      const amzMatch = matchFuzzy(amzRows, kw, ['keyword', 'search_category'], 'title', scopedAmz);
+      const aliMatch = matchFuzzy(aliRows, kw, ['keyword', 'search_category'], 'title', scopedAli);
 
       // ── KWP fields (from KWP seed row itself or kwpMatch)
       const avgMonthlySearches = Number(kwpMatch?.avg_monthly_searches ?? row.avg_monthly_searches ?? 0);
@@ -834,10 +992,12 @@ const Dashboard = () => {
         bestseller_rank: bestsellerRank,
         // Alibaba
         alibaba_title: aliTitle,
+        alibaba_price_min_usd: aliMatch?.alibaba_price_min_usd ? Number(aliMatch.alibaba_price_min_usd) : null,
         moq: moq || null,
         supplier_rating: supplierRating || null,
         supplier_country: supplierCountry,
         ali_category: aliCategory,
+        verified_supplier: aliMatch?.verified_supplier === true || aliMatch?.verified_supplier === 'true',
         // Scores
         demand_score: demandScore,
         trend_score: trendScore,
@@ -856,14 +1016,43 @@ const Dashboard = () => {
     setConsolidatedResults(ranked);
   }, [amazonResults, alibabaResults, keywordPlannerResults, trendsResults]);
 
-  // Trigger consolidation once the pipeline succeeds
+  // Apply UI filters to the consolidated list dynamically
+  const filteredConsolidatedResults = useMemo(() => {
+    return consolidatedResults.filter(row => {
+      // Amazon Filters
+      if (amazonFilters) {
+        if (priceMin > 0 && row.amazon_price_usd !== null && row.amazon_price_usd < priceMin) return false;
+        if (priceMax > 0 && row.amazon_price_usd !== null && row.amazon_price_usd > priceMax) return false;
+        if (reviewsMin > 0 && row.reviews_count !== null && row.reviews_count < reviewsMin) return false;
+        if (reviewsMax > 0 && row.reviews_count !== null && row.reviews_count > reviewsMax) return false;
+        if (ratingFilter > 0 && row.rating !== null && row.rating < ratingFilter) return false;
+      }
+      
+      // Alibaba Filters
+      if (alibabaFilters) {
+        if (costBelow > 0 && row.amazon_price_usd !== null && row.alibaba_price_min_usd !== null) {
+          const expectedMaxPrice = row.amazon_price_usd * (1 - costBelow);
+          if (row.alibaba_price_min_usd > expectedMaxPrice) return false;
+        }
+        if (moq && row.moq !== null && row.moq > parseInt(moq)) return false;
+        if (alibabaRating > 0 && row.supplier_rating !== null && row.supplier_rating < alibabaRating) return false;
+        if (verifiedSupplier && row.verified_supplier === false) return false;
+      }
+      return true;
+    });
+  }, [consolidatedResults, amazonFilters, priceMin, priceMax, reviewsMin, reviewsMax, ratingFilter, alibabaFilters, costBelow, moq, alibabaRating, verifiedSupplier]);
+
+  // Trigger consolidation once the pipeline succeeds, or for intermediate results during POLLING
   useEffect(() => {
-    if (pipelineStatus !== 'COMPLETED') return;
+    if (pipelineStatus === 'IDLE' || pipelineStatus === 'STARTING') return;
 
     if (searchingMode === 'CATEGORY BASED' && categoryExecutions.length > 0) {
-      // Category mode: aggregate data from ALL individual keyword executions
-      setStatusMessage('Aggregating stage data for all variants...');
+      // Always aggregate ALL succeeded variants' data into one consolidated table
+      // (regardless of which variant is selected in the dropdown — the dropdown
+      //  only filters the per-stage detail panels below the table)
+      if (pipelineStatus !== 'COMPLETED') return;
 
+      setStatusMessage('Aggregating stage data for all variants...');
       let isCancelled = false;
       const aggregateCategoryData = async () => {
         try {
@@ -896,63 +1085,83 @@ const Dashboard = () => {
           const results = await Promise.all(fetchPromises);
           if (isCancelled) return;
 
-          // Merge all child arrays
+          // Merge all child arrays into one mega dataset
           const megaKwp = results.flatMap(r => r.kwp);
           const megaTrends = results.flatMap(r => r.trends);
           const megaAmz = results.flatMap(r => r.amz);
           const megaAli = results.flatMap(r => r.ali);
 
-          // Force the consolidator to generate the scoreboard covering ALL variants
           buildConsolidated(megaKwp, megaTrends, megaAmz, megaAli);
           setStatusMessage('Category Pipeline completed! View stage data below.');
-
         } catch (e) {
-          console.error("Error aggregating category data", e);
+          console.error('Error aggregating category data', e);
         }
       };
 
       aggregateCategoryData();
       return () => { isCancelled = true; };
-    } else {
-      // Manual mode / Atai Auto: directly use the single set of React state arrays
+    } else if (searchingMode !== 'CATEGORY BASED') {
+      // Manual / ATAI AUTO: use the single-run data that was loaded via stage polling
       buildConsolidated();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pipelineStatus]);
+  }, [pipelineStatus, keywordPlannerResults, trendsResults, amazonResults, alibabaResults]);
   // ────────────────────────────────────────────────────────────────────────────
 
   // Handle stopping the current pipeline search
   const handleStopSearch = async () => {
-    if (!executionArn) return;
+    // 1. Signal any running frontend loop to stop
+    cancelTokenRef.current = true;
+
+    // 2. If it's the Category Based frontend loop, stop the loop and any running child executions
+    if (executionArn && executionArn.startsWith('category_search:frontend_managed:')) {
+      categoryExecutions.forEach(exec => {
+        if (exec.status === 'RUNNING' && exec.execution_arn) {
+          fetch(`/api/pipeline/stop?arn=${encodeURIComponent(exec.execution_arn)}`, { method: 'POST' }).catch(() => { });
+        }
+      });
+      setPipelineStatus('FAILED');
+      setStatusMessage('ABORTED');
+      setIsLoading(false);
+      return;
+    }
+
+    // 3. Normal / Auto single pipeline execution stop
+    // If executionArn is not yet available (STARTING phase, trigger API not yet returned),
+    // we still reset the UI state so the app doesn't get stuck.
+    if (!executionArn) {
+      setPipelineStatus('FAILED');
+      setStatusMessage('ABORTED');
+      setIsLoading(false);
+      return;
+    }
 
     try {
       const response = await fetch(`/api/pipeline/stop?arn=${encodeURIComponent(executionArn)}`, {
         method: 'POST'
       });
 
-
       if (response.ok) {
         const data = await response.json();
         console.log('Pipeline stopped successfully:', data);
-
-        // Clear the polling interval
-        if (pollingIntervalRef) {
-          clearInterval(pollingIntervalRef);
-          setPollingIntervalRef(null);
-        }
-
-        // Update pipeline state
-        setPipelineStatus('FAILED');
-        setStatusMessage('ABORTED');
-        setIsLoading(false);
-        // Don't set error for manual stop
-
       } else {
-        console.error('Failed to stop pipeline');
+        // Log but do NOT bail out — still reset the UI below.
+        console.error('Stop API returned an error status. UI will still be reset.');
       }
     } catch (error) {
-      console.error('Error stopping pipeline:', error);
+      // Network errors etc. — still reset the UI so it never gets stuck.
+      console.error('Error calling stop API:', error);
     }
+
+    // Always reset UI state regardless of whether the API call succeeded.
+    // The polling effect's cleanup will cancel the setInterval when pipelineStatus changes.
+    if (pollingIntervalRef) {
+      clearInterval(pollingIntervalRef);
+      setPollingIntervalRef(null);
+    }
+    setPipelineStatus('FAILED');
+    setStatusMessage('ABORTED');
+    setIsLoading(false);
   };
 
   const getApiParams = useCallback(() => {
@@ -1032,6 +1241,8 @@ const Dashboard = () => {
   };
 
   const handleSearch = useCallback(async () => {
+    cancelTokenRef.current = false;
+
     // Clear previous validation errors
     setKeywordSearchError('');
     setLocationError('');
@@ -1062,6 +1273,9 @@ const Dashboard = () => {
       if (!variantLimitMax.trim()) {
         setVariantLimitMaxError('Variant Limit Max is required');
         hasErrors = true;
+      } else if (parseInt(variantLimitMax.trim(), 10) > 30) {
+        setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
+        hasErrors = true;
       }
       if (!resultsCap.trim()) {
         setResultsCapError('Results Cap Max is required');
@@ -1079,6 +1293,7 @@ const Dashboard = () => {
 
     setIsLoading(true);
     setProducts([]); // Clear old results immediately
+    setConsolidatedResults([]); // Clear consolidated table from any previous run
     setError(null);
     setIsPreliminary(false);
     setPipelineStatus('IDLE');
@@ -1087,6 +1302,7 @@ const Dashboard = () => {
     setHasPerformedSearch(true);
     setSelectedCategoryVariant('ALL');
     setCategoryKeywordsPreview(null);
+    setCategoryExecutions([]);
     setKeywordPlannerResults(null);
     setKeywordPlannerMeta(null);
     setHasLoadedKeywordPlanner(false);
@@ -1159,7 +1375,7 @@ const Dashboard = () => {
         if (searchingMode === 'CATEGORY BASED') {
           // Frontend-driven category search orchestration
           setStatusMessage('GENERATING KEYWORDS...');
-          
+
           const kwResponse = await fetch('/api/pipeline/generate-keywords', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1190,20 +1406,49 @@ const Dashboard = () => {
           setCategoryExecutions(initialExecutions);
           setCategoryKeywordsPreview(generatedKeywords);
           setExecutionArn(`category_search:frontend_managed:${Date.now()}`); // Mock ARN to trigger polling loop later
+          setPipelineStatus('POLLING'); // Start polling early so we can track statuses during batching
+          setIsBatching(true);
           setStatusMessage('STARTING VARIANTS...');
-          
+
           // Fire and forget the sequential triggering logic
           (async () => {
             const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
-            
+            let lastTriggerTime = 0;
+
             for (let i = 0; i < generatedKeywords.length; i++) {
+              if (cancelTokenRef.current) break;
+
               const kw = generatedKeywords[i];
-              
-              if (i > 0) {
-                 setStatusMessage(`WAITING 15s BEFORE: ${kw}`);
-                 await sleep(15000);
+
+              // Batching Logic: Max 5 concurrent running variants
+              // and at least 5s between triggers
+              while (true) {
+                if (cancelTokenRef.current) break;
+
+                const activeCount = categoryExecutionsRef.current.filter(e =>
+                  e.status === 'RUNNING' || e.status === 'STARTING'
+                ).length;
+
+                const now = Date.now();
+                const timeSinceLast = now - lastTriggerTime;
+
+                if (activeCount < 5 && timeSinceLast >= 5000) {
+                  break;
+                }
+
+                if (activeCount >= 5) {
+                  setStatusMessage(`BATCH FULL (5/5). Waiting for a variant to finish...`);
+                } else if (timeSinceLast < 5000) {
+                  const waitSec = Math.ceil((5000 - timeSinceLast) / 1000);
+                  setStatusMessage(`WAITING ${waitSec}s BEFORE: ${kw}`);
+                }
+                await sleep(1000);
               }
-              
+
+              if (cancelTokenRef.current) break;
+
+              if (cancelTokenRef.current) break;
+
               setCategoryExecutions(prev => {
                 const next = [...prev];
                 next[i] = { ...next[i], status: 'STARTING' };
@@ -1218,14 +1463,14 @@ const Dashboard = () => {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify(triggerPayload)
                 });
-                
+
                 const triggerData = await triggerRes.json();
-                
+
                 if (triggerRes.ok && triggerData.success) {
                   setCategoryExecutions(prev => {
                     const next = [...prev];
-                    next[i] = { 
-                      ...next[i], 
+                    next[i] = {
+                      ...next[i],
                       status: 'RUNNING',
                       execution_arn: triggerData.executionArn,
                       run_id: triggerData.executionArn.split(':').pop() || '',
@@ -1233,7 +1478,7 @@ const Dashboard = () => {
                     return next;
                   });
                 } else {
-                   setCategoryExecutions(prev => {
+                  setCategoryExecutions(prev => {
                     const next = [...prev];
                     next[i] = { ...next[i], status: 'FAILED' };
                     return next;
@@ -1247,36 +1492,40 @@ const Dashboard = () => {
                   return next;
                 });
               }
+              lastTriggerTime = Date.now();
             }
-            setStatusMessage('RUNNING');
-            setPipelineStatus('POLLING');
+            // Only transition to final state if the user has not cancelled in the meantime.
+            if (!cancelTokenRef.current) {
+              setIsBatching(false);
+              setStatusMessage('RUNNING');
+            }
           })();
 
         } else {
           // Normal manual/auto search
           const triggerResponse = await fetch('/api/pipeline/trigger', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
 
-        if (!triggerResponse.ok) {
-          const errorData = await triggerResponse.json();
-          throw new Error(errorData.error || 'Failed to trigger pipeline');
-        }
+          if (!triggerResponse.ok) {
+            const errorData = await triggerResponse.json();
+            throw new Error(errorData.error || 'Failed to trigger pipeline');
+          }
 
-        const triggerData = await triggerResponse.json();
+          const triggerData = await triggerResponse.json();
 
-        if (!triggerData.success) {
-          throw new Error(triggerData.message || 'No data found for this search');
-        }
+          if (!triggerData.success) {
+            throw new Error(triggerData.message || 'No data found for this search');
+          }
 
-        setCategoryExecutions([]);
-        setCategoryKeywordsPreview(null);
-        setExecutionArn(triggerData.executionArn);
-        setPipelineStatus('POLLING');
-        setStatusMessage('RUNNING');
-        
+          setCategoryExecutions([]);
+          setCategoryKeywordsPreview(null);
+          setExecutionArn(triggerData.executionArn);
+          setPipelineStatus('POLLING');
+          setStatusMessage('RUNNING');
+
         } // end generic else
         // Note: status polling is now handled by the Polling Effect below
       } else {
@@ -1430,9 +1679,9 @@ const Dashboard = () => {
     setHasLoadedAlibaba(false);
   }, []);
 
-  // In category mode, when pipeline is completed and user selects a variant, fetch that keyword's stage data (same as manual mode)
+  // In category mode, when pipeline is completed (or polling), fetch that keyword's stage data
   useEffect(() => {
-    if (searchingMode !== 'CATEGORY BASED' || pipelineStatus !== 'COMPLETED') return;
+    if (searchingMode !== 'CATEGORY BASED' || (pipelineStatus !== 'COMPLETED' && pipelineStatus !== 'POLLING')) return;
 
     const selected = selectedCategoryVariant?.trim();
     if (!selected || selected === 'ALL') return;
@@ -1536,7 +1785,7 @@ const Dashboard = () => {
                 // Ignore ones that haven't been assigned an ARN yet or are already finished
                 if (exec.status === 'PENDING' || exec.status === 'STARTING' || !exec.execution_arn) return exec;
                 if (exec.status === 'SUCCEEDED' || exec.status === 'FAILED' || exec.status === 'ABORTED' || exec.status === 'TIMED_OUT') return exec;
-                
+
                 try {
                   const res = await fetch(`/api/pipeline/status?arn=${exec.execution_arn}`);
                   const data = await res.json();
@@ -1750,9 +1999,8 @@ const Dashboard = () => {
                     setLocationError('');
                   }
                 }}
-                className={`px-4 py-2 text-white bg-[#2a3828] border rounded-lg focus:outline-none focus:border-[#F3940B] transition-colors ${
-                  locationError ? 'border-red-500' : 'border-white/40'
-                } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                className={`px-4 py-2 text-white bg-[#2a3828] border rounded-lg focus:outline-none focus:border-[#F3940B] transition-colors ${locationError ? 'border-red-500' : 'border-white/40'
+                  } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
               >
                 <option value="">Select a country</option>
                 {countries.map((country) => (
@@ -1786,271 +2034,270 @@ const Dashboard = () => {
         {/* Combined Row: Searching Mode + Search Fields (Left) and Blacklisted Words (Right) */}
         <div className="bg-[#243022] border border-white/10 rounded-xl p-6 mb-6 shadow-xl">
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: Searching Mode + Search Fields in 2x2 grid */}
-          <div className="lg:col-span-2 space-y-5">
-            {/* Searching Mode - All in one line */}
-            <div className="flex items-center gap-5 flex-wrap">
-              <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">SEARCHING MODE:</span>
-              {['MANUAL', 'CATEGORY BASED', 'ATAI AUTO'].map((mode) => (
-                <label key={mode} className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="searchingMode"
-                    value={mode}
-                    checked={searchingMode === mode}
-                    onChange={(e) => setSearchingMode(e.target.value)}
-                    className="sr-only"
-                    style={{ accentColor: '#F3940B' }}
-                  />
-                  <span className={`px-3 py-1 text-xs font-bold tracking-wider rounded-full border transition-all ${
-                    searchingMode === mode
-                      ? 'bg-[#F3940B] border-[#F3940B] text-black shadow-lg shadow-orange-900/40'
-                      : 'border-white/30 text-gray-300 hover:border-white/60 hover:text-white'
-                  }`}>{mode}</span>
-                </label>
-              ))}
-            </div>
-
-            {/* Search Fields in 2x2 grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-              {searchingMode === 'MANUAL' ? (
-                <div>
-                  <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
-                    KEYWORD SEARCH <span className="text-[#F3940B] ml-0.5">*</span>
+            {/* Left: Searching Mode + Search Fields in 2x2 grid */}
+            <div className="lg:col-span-2 space-y-5">
+              {/* Searching Mode - All in one line */}
+              <div className="flex items-center gap-5 flex-wrap">
+                <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">SEARCHING MODE:</span>
+                {['MANUAL', 'CATEGORY BASED', 'ATAI AUTO'].map((mode) => (
+                  <label key={mode} className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="searchingMode"
+                      value={mode}
+                      checked={searchingMode === mode}
+                      onChange={(e) => setSearchingMode(e.target.value)}
+                      className="sr-only"
+                      style={{ accentColor: '#F3940B' }}
+                    />
+                    <span className={`px-3 py-1 text-xs font-bold tracking-wider rounded-full border transition-all ${searchingMode === mode
+                        ? 'bg-[#F3940B] border-[#F3940B] text-black shadow-lg shadow-orange-900/40'
+                        : 'border-white/30 text-gray-300 hover:border-white/60 hover:text-white'
+                      }`}>{mode}</span>
                   </label>
-                  <input
-                    type="text"
-                    value={keywordSearch}
-                    disabled={fieldsDisabled}
-                    onChange={(e) => {
-                      setKeywordSearch(e.target.value);
-                      if (keywordSearchError) {
-                        setKeywordSearchError('');
-                      }
-                    }}
-                    className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${
-                      keywordSearchError ? 'border-red-500' : 'border-gray-300'
-                    } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-                  />
-                  {keywordSearchError && (
-                    <p className="text-red-400 text-xs mt-1">{keywordSearchError}</p>
-                  )}
-                </div>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  <label className="text-xs font-bold tracking-widest text-gray-400 uppercase">PRODUCT CATEGORY <span className="text-[#F3940B]">*</span></label>
-                  <select
-                    value={productCategory}
-                    onChange={(e) => setProductCategory(e.target.value)}
-                    className="w-full px-4 py-2.5 text-black bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40"
-                  >
-                    {GT_CATEGORIES.map((cat) => (
-                      <option key={cat} value={cat}>{cat}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              {/* Trend Period - only show when Active Search is ON */}
-              {activeSearch && (
-                <div className="flex flex-col items-start gap-2 relative">
-                  <div className="flex items-center gap-4 flex-col">
-                    <span className="text-xs font-bold tracking-widest text-gray-400 uppercase flex items-center">
-                      TREND PERIOD <span className="text-[#F3940B] ml-0.5">*</span>
-                      {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
-                    </span>
-                    <div className="relative trend-dropdown">
-                      <button
-                        onClick={() => !pipelineFieldsDisabled && setShowTrendDropdown(!showTrendDropdown)}
+                ))}
+              </div>
+
+              {/* Search Fields in 2x2 grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                {searchingMode === 'MANUAL' ? (
+                  <div>
+                    <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
+                      KEYWORD SEARCH <span className="text-[#F3940B] ml-0.5">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={keywordSearch}
+                      disabled={fieldsDisabled}
+                      onChange={(e) => {
+                        setKeywordSearch(e.target.value);
+                        if (keywordSearchError) {
+                          setKeywordSearchError('');
+                        }
+                      }}
+                      className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${keywordSearchError ? 'border-red-500' : 'border-gray-300'
+                        } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    />
+                    {keywordSearchError && (
+                      <p className="text-red-400 text-xs mt-1">{keywordSearchError}</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <label className="text-xs font-bold tracking-widest text-gray-400 uppercase">PRODUCT CATEGORY <span className="text-[#F3940B]">*</span></label>
+                    <select
+                      value={productCategory}
+                      onChange={(e) => setProductCategory(e.target.value)}
+                      className="w-full px-4 py-2.5 text-black bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40"
+                    >
+                      {GT_CATEGORIES.map((cat) => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {/* Trend Period - only show when Active Search is ON */}
+                {activeSearch && (
+                  <div className="flex flex-col items-start gap-2 relative">
+                    <div className="flex items-center gap-4 flex-col">
+                      <span className="text-xs font-bold tracking-widest text-gray-400 uppercase flex items-center">
+                        TREND PERIOD <span className="text-[#F3940B] ml-0.5">*</span>
+                        {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
+                      </span>
+                      <div className="relative trend-dropdown">
+                        <button
+                          onClick={() => !pipelineFieldsDisabled && setShowTrendDropdown(!showTrendDropdown)}
+                          disabled={pipelineFieldsDisabled}
+                          className={`px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 min-w-[150px] flex items-center justify-between ${trendPeriodError ? 'border-red-500' : 'border-gray-300'
+                            } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        >
+                          <span>{trendPeriod || 'Select period'}</span>
+                          <span className="ml-2">▼</span>
+                        </button>
+                        {showTrendDropdown && (
+                          <div className="absolute top-full left-0 mt-1 w-full bg-white border border-gray-300 shadow-lg z-50 max-h-48 overflow-y-auto">
+                            {Array.from({ length: 12 }, (_, i) => i + 1).map((period) => (
+                              <button
+                                key={period}
+                                onClick={() => {
+                                  setTrendPeriod(period.toString());
+                                  setShowTrendDropdown(false);
+                                  if (trendPeriodError) {
+                                    setTrendPeriodError('');
+                                  }
+                                }}
+                                className="w-full px-3 py-2 text-left text-black hover:bg-gray-100 focus:outline-none focus:bg-gray-100"
+                              >
+                                {period}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    {trendPeriodError && (
+                      <p className="text-red-400 text-xs ml-28">{trendPeriodError}</p>
+                    )}
+                  </div>
+                )}
+
+                {/* VARIANT LIMIT MAX and RESULTS CAP MAX - only show when Active Search is ON */}
+                {activeSearch && (
+                  <>
+                    <div>
+                      <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
+                        VARIANT LIMIT MAX <span className="text-[#F3940B] ml-0.5">*</span>
+                        {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
+                      </label>
+                      <input
+                        type="text"
+                        value={variantLimitMax}
                         disabled={pipelineFieldsDisabled}
-                        className={`px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 min-w-[150px] flex items-center justify-between ${
-                          trendPeriodError ? 'border-red-500' : 'border-gray-300'
-                        } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-                      >
-                        <span>{trendPeriod || 'Select period'}</span>
-                        <span className="ml-2">▼</span>
-                      </button>
-                      {showTrendDropdown && (
-                        <div className="absolute top-full left-0 mt-1 w-full bg-white border border-gray-300 shadow-lg z-50 max-h-48 overflow-y-auto">
-                          {Array.from({ length: 12 }, (_, i) => i + 1).map((period) => (
-                            <button
-                              key={period}
-                              onClick={() => {
-                                setTrendPeriod(period.toString());
-                                setShowTrendDropdown(false);
-                                if (trendPeriodError) {
-                                  setTrendPeriodError('');
-                                }
-                              }}
-                              className="w-full px-3 py-2 text-left text-black hover:bg-gray-100 focus:outline-none focus:bg-gray-100"
-                            >
-                              {period}
-                            </button>
-                          ))}
-                        </div>
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setVariantLimitMax(val);
+                          const parsed = parseInt(val.trim(), 10);
+                          if (parsed > 30) {
+                            setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
+                          } else if (variantLimitMaxError) {
+                            setVariantLimitMaxError('');
+                          }
+                        }}
+                        className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${variantLimitMaxError ? 'border-red-500' : 'border-gray-300'
+                          } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      />
+                      {variantLimitMaxError && (
+                        <p className="text-red-400 text-xs mt-1">{variantLimitMaxError}</p>
                       )}
                     </div>
-                  </div>
-                  {trendPeriodError && (
-                    <p className="text-red-400 text-xs ml-28">{trendPeriodError}</p>
-                  )}
-                </div>
-              )}
-
-              {/* VARIANT LIMIT MAX and RESULTS CAP MAX - only show when Active Search is ON */}
-              {activeSearch && (
-                <>
-                  <div>
-                    <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
-                      VARIANT LIMIT MAX <span className="text-[#F3940B] ml-0.5">*</span>
-                      {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
-                    </label>
-                    <input
-                      type="text"
-                      value={variantLimitMax}
-                      disabled={pipelineFieldsDisabled}
-                      onChange={(e) => {
-                        setVariantLimitMax(e.target.value);
-                        if (variantLimitMaxError) {
-                          setVariantLimitMaxError('');
-                        }
-                      }}
-                      className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${
-                        variantLimitMaxError ? 'border-red-500' : 'border-gray-300'
-                      } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    />
-                    {variantLimitMaxError && (
-                      <p className="text-red-400 text-xs mt-1">{variantLimitMaxError}</p>
-                    )}
-                  </div>
-                  <div>
-                    <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
-                      RESULTS CAP MAX <span className="text-[#F3940B] ml-0.5">*</span>
-                      {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
-                    </label>
-                    <input
-                      type="text"
-                      value={resultsCap}
-                      disabled={pipelineFieldsDisabled}
-                      onChange={(e) => {
-                        setResultsCap(e.target.value);
-                        if (resultsCapError) {
-                          setResultsCapError('');
-                        }
-                      }}
-                      className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${
-                        resultsCapError ? 'border-red-500' : 'border-gray-300'
-                      } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    />
-                    {resultsCapError && (
-                      <p className="text-red-400 text-xs mt-1">{resultsCapError}</p>
-                    )}
-                  </div>
-                </>
-              )}
+                    <div>
+                      <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2 flex items-center">
+                        RESULTS CAP MAX <span className="text-[#F3940B] ml-0.5">*</span>
+                        {pipelineFieldsDisabled && <InfoButton message="Please reset in order to apply filters for new search" />}
+                      </label>
+                      <input
+                        type="text"
+                        value={resultsCap}
+                        disabled={pipelineFieldsDisabled}
+                        onChange={(e) => {
+                          setResultsCap(e.target.value);
+                          if (resultsCapError) {
+                            setResultsCapError('');
+                          }
+                        }}
+                        className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${resultsCapError ? 'border-red-500' : 'border-gray-300'
+                          } ${pipelineFieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      />
+                      {resultsCapError && (
+                        <p className="text-red-400 text-xs mt-1">{resultsCapError}</p>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
-          </div>
 
-          {/* Right: Blacklisted Words */}
-          <div>
-            <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2">BLACKLISTED WORDS</label>
-            <div 
-              className="flex flex-col w-full h-32 bg-[#FFFFFF] border border-gray-600 focus-within:border-blue-500 overflow-hidden cursor-text"
-              onClick={() => document.getElementById('blacklist-input')?.focus()}
-            >
-              <div className="flex flex-wrap gap-2 p-2 overflow-y-auto w-full h-full content-start">
-                {blacklistedWords.map((word, index) => (
-                  <div key={index} className="flex items-center gap-1 bg-gray-200 text-black px-2 py-1 rounded-md text-sm border border-gray-300 shadow-sm leading-none shrink-0">
-                    <span className="max-w-[150px] truncate" title={word}>{word}</span>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setBlacklistedWords(prev => prev.filter((_, i) => i !== index));
-                      }}
-                      className="text-gray-500 hover:text-red-500 rounded-full w-4 h-4 flex items-center justify-center font-bold text-lg leading-none shrink-0 pb-1"
-                      title="Remove word"
-                    >
-                      &times;
-                    </button>
-                  </div>
-                ))}
-                <input
-                  id="blacklist-input"
-                  type="text"
-                  value={blacklistInput}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (val.includes(',')) {
-                      const newWords = val.split(',').map(w => w.trim()).filter(w => w.length > 0);
-                      if (newWords.length > 0) {
-                        setBlacklistedWords(prev => Array.from(new Set([...prev, ...newWords])));
+            {/* Right: Blacklisted Words */}
+            <div>
+              <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2">BLACKLISTED WORDS</label>
+              <div
+                className="flex flex-col w-full h-32 bg-[#FFFFFF] border border-gray-600 focus-within:border-blue-500 overflow-hidden cursor-text"
+                onClick={() => document.getElementById('blacklist-input')?.focus()}
+              >
+                <div className="flex flex-wrap gap-2 p-2 overflow-y-auto w-full h-full content-start">
+                  {blacklistedWords.map((word, index) => (
+                    <div key={index} className="flex items-center gap-1 bg-gray-200 text-black px-2 py-1 rounded-md text-sm border border-gray-300 shadow-sm leading-none shrink-0">
+                      <span className="max-w-[150px] truncate" title={word}>{word}</span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setBlacklistedWords(prev => prev.filter((_, i) => i !== index));
+                        }}
+                        className="text-gray-500 hover:text-red-500 rounded-full w-4 h-4 flex items-center justify-center font-bold text-lg leading-none shrink-0 pb-1"
+                        title="Remove word"
+                      >
+                        &times;
+                      </button>
+                    </div>
+                  ))}
+                  <input
+                    id="blacklist-input"
+                    type="text"
+                    value={blacklistInput}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val.includes(',')) {
+                        const newWords = val.split(',').map(w => w.trim()).filter(w => w.length > 0);
+                        if (newWords.length > 0) {
+                          setBlacklistedWords(prev => Array.from(new Set([...prev, ...newWords])));
+                        }
+                        setBlacklistInput('');
+                      } else {
+                        setBlacklistInput(val);
                       }
-                      setBlacklistInput('');
-                    } else {
-                      setBlacklistInput(val);
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const val = blacklistInput.trim();
+                        if (val) {
+                          setBlacklistedWords(prev => prev.includes(val) ? prev : [...prev, val]);
+                          setBlacklistInput('');
+                        }
+                      } else if (e.key === 'Backspace' && blacklistInput === '' && blacklistedWords.length > 0) {
+                        // Remove the last chip if backspace is pressed on empty input
+                        setBlacklistedWords(prev => prev.slice(0, -1));
+                      }
+                    }}
+                    onBlur={() => {
+                      // Automatically convert any leftover text into a chip when clicking away
                       const val = blacklistInput.trim();
                       if (val) {
                         setBlacklistedWords(prev => prev.includes(val) ? prev : [...prev, val]);
                         setBlacklistInput('');
                       }
-                    } else if (e.key === 'Backspace' && blacklistInput === '' && blacklistedWords.length > 0) {
-                      // Remove the last chip if backspace is pressed on empty input
-                      setBlacklistedWords(prev => prev.slice(0, -1));
-                    }
-                  }}
-                  onBlur={() => {
-                    // Automatically convert any leftover text into a chip when clicking away
-                    const val = blacklistInput.trim();
-                    if (val) {
-                      setBlacklistedWords(prev => prev.includes(val) ? prev : [...prev, val]);
-                      setBlacklistInput('');
-                    }
-                  }}
-                  placeholder={blacklistedWords.length === 0 ? "Type and press Enter or comma..." : ""}
-                  className="flex-1 min-w-[120px] bg-transparent outline-none text-black text-sm h-7"
-                />
+                    }}
+                    placeholder={blacklistedWords.length === 0 ? "Type and press Enter or comma..." : ""}
+                    className="flex-1 min-w-[120px] bg-transparent outline-none text-black text-sm h-7"
+                  />
+                </div>
               </div>
             </div>
-          </div>
           </div>
         </div>
 
         {/* Fourth Row: Google Trend Score, KWP Monthly Searches */}
         <div className="bg-[#243022] border border-white/10 rounded-xl px-6 py-5 mb-6 shadow-lg">
           <div className="flex flex-wrap items-center gap-8 lg:gap-14">
-          {/* Google Trend Score */}
-          <div className="flex items-center gap-4">
-            <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">GOOGLE TREND SCORE</span>
-            <div className="h-5 flex items-center bg-white px-3 py-2 ">
-              <svg width="20" height="12" viewBox="0 0 20 12" className="mr-2">
-                {/* Google Trends icon */}
-                <path d="M2 10 L6 6 L10 8 L18 2" stroke="#4285f4" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-                <circle cx="2" cy="10" r="2" fill="#34a853" />
-                <circle cx="6" cy="6" r="2" fill="#fbbc04" />
-                <circle cx="10" cy="8" r="2" fill="#ea4335" />
-                <circle cx="18" cy="2" r="2" fill="#4285f4" />
-              </svg>
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-gray-800">0</span>
-                <div className="relative w-20">
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={googleTrendScore}
-                    onChange={(e) => setGoogleTrendScore(Number(e.target.value))}
-                    className="w-full h-2 bg-gray-300 rounded-full appearance-none cursor-pointer"
-                    style={{
-                      background: `linear-gradient(to right, #10b981 0%, #10b981 ${googleTrendScore}%, #d1d5db ${googleTrendScore}%, #d1d5db 100%)`,
-                      WebkitAppearance: 'none',
-                      outline: 'none'
-                    }}
-                  />
-                  <style jsx>{`
+            {/* Google Trend Score */}
+            <div className="flex items-center gap-4">
+              <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">GOOGLE TREND SCORE</span>
+              <div className="h-5 flex items-center bg-white px-3 py-2 ">
+                <svg width="20" height="12" viewBox="0 0 20 12" className="mr-2">
+                  {/* Google Trends icon */}
+                  <path d="M2 10 L6 6 L10 8 L18 2" stroke="#4285f4" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                  <circle cx="2" cy="10" r="2" fill="#34a853" />
+                  <circle cx="6" cy="6" r="2" fill="#fbbc04" />
+                  <circle cx="10" cy="8" r="2" fill="#ea4335" />
+                  <circle cx="18" cy="2" r="2" fill="#4285f4" />
+                </svg>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-800">0</span>
+                  <div className="relative w-20">
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      value={googleTrendScore}
+                      onChange={(e) => setGoogleTrendScore(Number(e.target.value))}
+                      className="w-full h-2 bg-gray-300 rounded-full appearance-none cursor-pointer"
+                      style={{
+                        background: `linear-gradient(to right, #10b981 0%, #10b981 ${googleTrendScore}%, #d1d5db ${googleTrendScore}%, #d1d5db 100%)`,
+                        WebkitAppearance: 'none',
+                        outline: 'none'
+                      }}
+                    />
+                    <style jsx>{`
                     input[type="range"]::-webkit-slider-thumb {
                       appearance: none;
                       width: 14px;
@@ -2072,47 +2319,47 @@ const Dashboard = () => {
                       box-shadow: 0 2px 4px rgba(0,0,0,0.2);
                     }
                   `}</style>
+                  </div>
+                  <span className="text-xs font-medium text-gray-800 min-w-[2.5rem] text-right">
+                    {googleTrendScore}
+                  </span>
                 </div>
-                <span className="text-xs font-medium text-gray-800 min-w-[2.5rem] text-right">
-                  {googleTrendScore}
-                </span>
               </div>
             </div>
-          </div>
-          <div>
-            <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2">KWP MONTHLY SEARCHES</label>
-            <div className="flex items-center gap-2">
-              <div className="flex flex-col items-start gap-1 flex-1">
-                <span className="text-xs text-gray-300">MIN</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={kwpMinSearches}
-                  onChange={(e) => setKwpMinSearches(e.target.value)}
-                  placeholder="e.g. 1000"
+            <div>
+              <label className="block text-xs font-bold tracking-widest text-gray-400 uppercase mb-2">KWP MONTHLY SEARCHES</label>
+              <div className="flex items-center gap-2">
+                <div className="flex flex-col items-start gap-1 flex-1">
+                  <span className="text-xs text-gray-300">MIN</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={kwpMinSearches}
+                    onChange={(e) => setKwpMinSearches(e.target.value)}
+                    placeholder="e.g. 1000"
 
-                  className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
-                />
-              </div>
-              <span className="text-gray-300 mt-5">–</span>
-              <div className="flex flex-col items-start gap-1 flex-1">
-                <span className="text-xs text-gray-300">MAX</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={kwpMaxSearches}
-                  onChange={(e) => setKwpMaxSearches(e.target.value)}
-                  placeholder="e.g. 50000"
-                  className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
-                />
+                    className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <span className="text-gray-300 mt-5">–</span>
+                <div className="flex flex-col items-start gap-1 flex-1">
+                  <span className="text-xs text-gray-300">MAX</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={kwpMaxSearches}
+                    onChange={(e) => setKwpMaxSearches(e.target.value)}
+                    placeholder="e.g. 50000"
+                    className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
               </div>
             </div>
+
+
+            {/* Trend Period */}
+
           </div>
-
-
-          {/* Trend Period */}
-
-        </div>
         </div>
 
         {/* Amazon Filters */}
@@ -2122,14 +2369,12 @@ const Dashboard = () => {
             {/* Toggle switch */}
             <button
               onClick={() => setAmazonFilters(!amazonFilters)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${
-                amazonFilters ? 'bg-[#F3940B]' : 'bg-gray-600'
-              }`}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${amazonFilters ? 'bg-[#F3940B]' : 'bg-gray-600'
+                }`}
             >
               <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${
-                  amazonFilters ? 'translate-x-6' : 'translate-x-1'
-                }`}
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${amazonFilters ? 'translate-x-6' : 'translate-x-1'
+                  }`}
               />
             </button>
             <span className="text-xs font-bold tracking-widest text-gray-400">{amazonFilters ? 'ON' : 'OFF'}</span>
@@ -2277,14 +2522,12 @@ const Dashboard = () => {
             {/* Toggle switch */}
             <button
               onClick={() => setAlibabaFilters(!alibabaFilters)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${
-                alibabaFilters ? 'bg-blue-500' : 'bg-gray-600'
-              }`}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${alibabaFilters ? 'bg-blue-500' : 'bg-gray-600'
+                }`}
             >
               <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${
-                  alibabaFilters ? 'translate-x-6' : 'translate-x-1'
-                }`}
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${alibabaFilters ? 'translate-x-6' : 'translate-x-1'
+                  }`}
               />
             </button>
             <span className="text-xs font-bold tracking-widest text-gray-400">{alibabaFilters ? 'ON' : 'OFF'}</span>
@@ -2407,123 +2650,180 @@ const Dashboard = () => {
         </div>
 
         {/* ── Preset System + Bottom Action Bar ─────────────────────────── */}
-        <div className="flex flex-col sm:flex-row gap-3 justify-center items-center mt-4">
+        {(() => {
+          const isActiveRun = isLoading || pipelineStatus === 'STARTING' || pipelineStatus === 'POLLING' || isBatching;
+          return (
+            <div className="flex flex-col sm:flex-row gap-3 justify-center items-center mt-4">
 
-          {/* Preset dropdown button */}
-          <div className="relative">
-            <button
-              onClick={() => setPresetDropdownOpen(o => !o)}
-              className="flex items-center gap-2 px-4 py-2.5 bg-[#243022] border border-white/20 text-white text-sm font-semibold rounded-lg hover:border-white/50 transition-colors"
-            >
-              {presetSaveFlash
-                ? <span className="text-green-400">✓ SAVED</span>
-                : selectedPresetId !== null && presets.find(p => p.id === selectedPresetId)
-                  ? presets.find(p => p.id === selectedPresetId)!.name
-                  : 'PRESETS'}
-              <svg className={`w-3 h-3 transition-transform ${presetDropdownOpen ? 'rotate-180' : ''}`} fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-              </svg>
-            </button>
+              {/* Preset dropdown button */}
+              <div className="relative" ref={dropdownRef}>
+                <button
+                  disabled={isActiveRun}
+                  onClick={() => setPresetDropdownOpen(o => !o)}
+                  className={`flex items-center gap-2 px-4 py-2.5 bg-[#243022] border border-white/20 text-white text-sm font-semibold rounded-lg transition-colors ${isActiveRun ? 'opacity-50 cursor-not-allowed' : 'hover:border-white/50'}`}
+                >
+                  {presetSaveFlash
+                    ? <span className="text-green-400">✓ SAVED</span>
+                    : selectedPresetId !== null && presets.find(p => p.id === selectedPresetId)
+                      ? presets.find(p => p.id === selectedPresetId)!.name
+                      : 'PRESETS'}
+                  <svg className={`w-3 h-3 transition-transform ${presetDropdownOpen ? 'rotate-180' : ''}`} fill="currentColor" viewBox="0 0 20 20">
+                    <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+                  </svg>
+                </button>
 
-            {presetDropdownOpen && (
-              <div className="absolute bottom-full mb-2 left-0 z-50 bg-[#1a2318] border border-white/20 rounded-xl shadow-2xl min-w-[260px] overflow-hidden">
-                {/* Preset list */}
-                {presets.length === 0 ? (
-                  <div className="px-4 py-3 text-sm text-gray-400 text-center">No presets saved yet.</div>
-                ) : (
-                  <div className="flex flex-col">
-                    {presets.map((p) => (
-                      <div key={p.id} className={`flex items-center gap-1 px-3 py-2 border-b border-white/5 hover:bg-white/5 ${selectedPresetId === p.id ? 'bg-white/10' : ''}`}>
-                        {/* Name / rename input */}
-                        {editingPresetId === p.id ? (
-                          <input
-                            autoFocus
-                            type="text"
-                            value={presetNameInput}
-                            onChange={(e) => setPresetNameInput(e.target.value)}
-                            onBlur={() => handleRenamePreset(p.id, presetNameInput)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') handleRenamePreset(p.id, presetNameInput);
-                              if (e.key === 'Escape') setEditingPresetId(null);
-                            }}
-                            className="flex-1 px-2 py-0.5 text-black bg-white text-sm rounded focus:outline-none"
-                          />
-                        ) : (
-                          <button
-                            onClick={() => setSelectedPresetId(p.id)}
-                            className="flex-1 text-left text-sm text-white truncate"
-                          >
-                            {p.name}
-                          </button>
-                        )}
-                        {/* Icon buttons */}
-                        <button
-                          title="Load"
-                          onClick={() => { setSelectedPresetId(p.id); handleLoadPreset(); setPresetDropdownOpen(false); }}
-                          className="shrink-0 px-2 py-0.5 text-xs text-[#C0FE72] border border-[#C0FE72]/40 rounded hover:bg-[#C0FE72]/10 transition-colors"
-                        >⬆ LOAD</button>
-                        <button
-                          title="Rename"
-                          onClick={() => { setPresetNameInput(p.name); setEditingPresetId(p.id); }}
-                          className="shrink-0 px-2 py-0.5 text-xs text-gray-300 border border-white/20 rounded hover:bg-white/10 transition-colors"
-                        >✎</button>
-                        <button
-                          title="Delete"
-                          onClick={() => handleDeletePreset(p.id)}
-                          className="shrink-0 px-2 py-0.5 text-xs text-red-400 border border-red-500/30 rounded hover:bg-red-500/10 transition-colors"
-                        >🗑</button>
+                {presetDropdownOpen && !isActiveRun && (
+                  <div className="absolute bottom-full mb-2 left-0 z-50 bg-[#1a2318] border border-white/20 rounded-xl shadow-2xl min-w-[260px] overflow-hidden">
+                    {/* Preset list */}
+                    {presets.length === 0 ? (
+                      <div className="px-4 py-3 text-sm text-gray-400 text-center">No presets saved yet.</div>
+                    ) : (
+                      <div className="flex flex-col">
+                        {presets.map((p) => (
+                          <div key={p.id} className={`flex items-center gap-1 px-3 py-2 border-b border-white/5 hover:bg-white/5 ${selectedPresetId === p.id ? 'bg-white/10' : ''}`}>
+                            {/* Name / rename input */}
+                            {editingPresetId === p.id ? (
+                              <input
+                                autoFocus
+                                type="text"
+                                value={presetNameInput}
+                                onChange={(e) => setPresetNameInput(e.target.value)}
+                                onBlur={() => handleRenamePreset(p.id, presetNameInput)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') handleRenamePreset(p.id, presetNameInput);
+                                  if (e.key === 'Escape') setEditingPresetId(null);
+                                }}
+                                className="flex-1 px-2 py-0.5 text-black bg-white text-sm rounded focus:outline-none"
+                              />
+                            ) : (
+                              <button
+                                onClick={() => setSelectedPresetId(p.id)}
+                                className="flex-1 text-left text-sm text-white truncate"
+                              >
+                                {p.name}
+                              </button>
+                            )}
+                            {/* Icon buttons */}
+                            <button
+                              title="Load"
+                              onClick={() => { setSelectedPresetId(p.id); handleLoadPreset(p.id); setPresetDropdownOpen(false); }}
+                              className="shrink-0 px-2 py-0.5 text-xs text-[#C0FE72] border border-[#C0FE72]/40 rounded hover:bg-[#C0FE72]/10 transition-colors"
+                            >⬆ LOAD</button>
+                            <button
+                              title="Rename"
+                              onClick={() => { setPresetNameInput(p.name); setEditingPresetId(p.id); }}
+                              className="shrink-0 px-2 py-0.5 text-xs text-gray-300 border border-white/20 rounded hover:bg-white/10 transition-colors"
+                            >✎</button>
+                            <button
+                              title="Delete"
+                              onClick={() => handleDeletePreset(p.id)}
+                              className="shrink-0 px-2 py-0.5 text-xs text-red-400 border border-red-500/30 rounded hover:bg-red-500/10 transition-colors"
+                            >🗑</button>
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
+                    {/* Save new preset */}
+                    <div className="px-3 py-2 border-t border-white/10 mt-1 pt-3">
+                      {isCreatingNewPreset ? (
+                        <div className="flex flex-col gap-2">
+                          <label className="text-xs text-gray-400 font-bold ml-1">New Preset Name</label>
+                          <div className="flex items-center gap-1">
+                            <input
+                              autoFocus
+                              type="text"
+                              className="flex-1 px-3 py-1.5 text-black bg-white/90 font-semibold text-sm rounded focus:outline-none focus:ring-2 focus:ring-[#C0FE72]"
+                              value={newPresetNameInput}
+                              onChange={(e) => setNewPresetNameInput(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  handleSaveNewPreset(newPresetNameInput);
+                                  setIsCreatingNewPreset(false);
+                                  setPresetDropdownOpen(false);
+                                }
+                                if (e.key === 'Escape') setIsCreatingNewPreset(false);
+                              }}
+                            />
+                            <button
+                              onClick={() => {
+                                handleSaveNewPreset(newPresetNameInput);
+                                setIsCreatingNewPreset(false);
+                                setPresetDropdownOpen(false);
+                              }}
+                              className="shrink-0 px-3 py-1.5 text-xs font-bold bg-[#C0FE72] text-[#1a2318] rounded hover:bg-[#d4ff8a]"
+                            >
+                              ✓
+                            </button>
+                            <button
+                              onClick={() => setIsCreatingNewPreset(false)}
+                              className="shrink-0 px-2 py-1.5 text-xs font-bold bg-white/10 text-white rounded hover:bg-white/20"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            let nextNum = 1;
+                            const existing = new Set(presets.map(p => p.name));
+                            while (existing.has(`Preset ${nextNum}`)) nextNum++;
+                            setNewPresetNameInput(`Preset ${nextNum}`);
+                            setIsCreatingNewPreset(true);
+                          }}
+                          className="w-full py-2 text-xs font-bold tracking-widest text-[#1a2318] bg-[#C0FE72] rounded-lg hover:bg-[#d4ff8a] transition-colors"
+                        >
+                          💾 SAVE NEW PRESET
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )}
-                {/* Save new preset */}
-                <div className="px-3 py-2">
-                  <button
-                    onClick={() => { handleSaveNewPreset(); setPresetDropdownOpen(false); }}
-                    className="w-full py-2 text-xs font-bold tracking-widest text-[#1a2318] bg-[#C0FE72] rounded-lg hover:bg-[#d4ff8a] transition-colors"
-                  >
-                    💾 SAVE NEW PRESET
-                  </button>
-                </div>
               </div>
-            )}
-          </div>
 
-          <button
-            onClick={handleReset}
-            className="px-6 py-2.5 bg-transparent text-white font-semibold tracking-wider border border-white/50 rounded-lg hover:bg-white/10 transition-colors text-sm"
-          >
-            ↺ RESET
-          </button>
+              <button
+                onClick={handleReset}
+                disabled={isActiveRun}
+                className={`px-6 py-2.5 bg-transparent font-semibold tracking-wider border border-white/50 rounded-lg transition-colors text-sm ${isActiveRun ? 'opacity-50 cursor-not-allowed text-gray-400' : 'text-white hover:bg-white/10'}`}
+              >
+                ↺ RESET
+              </button>
 
-          <button
-            onClick={handleExportCsv}
-            disabled={pipelineStatus !== 'COMPLETED'}
-            className={`px-7 py-2.5 rounded-lg font-bold tracking-wide transition-all text-sm ${
-              pipelineStatus === 'COMPLETED'
-                ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/40'
-                : 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
-            }`}
-          >
-            ⬇ EXPORT CSV
-          </button>
+              <button
+                onClick={handleExportCsv}
+                disabled={isActiveRun || pipelineStatus !== 'COMPLETED'}
+                className={`px-7 py-2.5 rounded-lg font-bold tracking-wide transition-all text-sm ${!isActiveRun && pipelineStatus === 'COMPLETED'
+                    ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/40'
+                    : 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
+                  }`}
+              >
+                ⬇ EXPORT CSV
+              </button>
 
-          <button
-            onClick={handleSearch}
-            disabled={isLoading}
-            className="px-10 py-2.5 bg-[#F3940B] text-black font-bold tracking-wider rounded-lg hover:bg-[#e8860a] transition-all shadow-lg shadow-orange-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-          >
-            {isLoading ? '⟳ SEARCHING...' : '⬛ SEARCH'}
-          </button>
+              <button
+                onClick={handleSearch}
+                disabled={isActiveRun || !!variantLimitMaxError}
+                className={`px-10 py-2.5 font-bold tracking-wider rounded-lg transition-all text-sm ${isActiveRun || variantLimitMaxError
+                    ? 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
+                    : 'bg-[#F3940B] text-black hover:bg-[#e8860a] shadow-lg shadow-orange-900/40'
+                  }`}
+              >
+                {isActiveRun ? '⟳ SEARCHING...' : '⬛ SEARCH'}
+              </button>
 
-          <button
-            onClick={handleStopSearch}
-            disabled={!executionArn || pipelineStatus !== 'POLLING'}
-            className="px-7 py-2.5 bg-red-700 text-white font-bold tracking-wide rounded-lg hover:bg-red-600 transition-all shadow-lg shadow-red-900/40 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-          >
-            ✕ STOP CURRENT SEARCH
-          </button>
-        </div>
+              <button
+                onClick={handleStopSearch}
+                disabled={!isActiveRun}
+                className={`px-7 py-2.5 font-bold tracking-wide rounded-lg transition-all text-sm ${isActiveRun
+                    ? 'bg-red-700 text-white hover:bg-red-600 shadow-lg shadow-red-900/40'
+                    : 'bg-gray-700/60 text-gray-400 opacity-50 cursor-not-allowed border border-white/10'
+                  }`}
+              >
+                ✕ STOP CURRENT SEARCH
+              </button>
+            </div>
+          );
+        })()}
 
         {/* Products Results Table */}
         {(products.length > 0 || error || isLoading || pipelineStatus !== 'IDLE' || hasPerformedSearch) && (
@@ -2538,8 +2838,8 @@ const Dashboard = () => {
               </div>
             )}
 
-            {/* ── CONSOLIDATED RESULTS TABLE – shown as soon as pipeline COMPLETES ── */}
-            {pipelineStatus === 'COMPLETED' && consolidatedResults.length > 0 && (
+            {/* ── CONSOLIDATED RESULTS TABLE – shown as soon as pipeline starts delivering data ── */}
+            {(pipelineStatus === 'COMPLETED' || pipelineStatus === 'POLLING') && consolidatedResults.length > 0 && (
               <div className="mt-6 mb-10">
                 {/* Header */}
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5 border-b border-[#C0FE72]/30 pb-4">
@@ -2565,11 +2865,16 @@ const Dashboard = () => {
                   <span><strong className="text-[#C0FE72]">Price</strong> 10% · Amazon price relative to others</span>
                 </div>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full border-separate border-spacing-0 border border-white/20 bg-[#2a3627] text-sm">
-                    <thead>
+                {/* Scrollable container referencing the mainTableScrollRef */}
+                <div
+                  className="overflow-x-auto overflow-y-auto max-h-[80vh] border border-white/20 rounded custom-scrollbar relative"
+                  ref={mainTableScrollRef}
+                  onScroll={handleMainTableScroll}
+                >
+                  <table className="w-full border-separate border-spacing-0 bg-[#2a3627] text-sm">
+                    <thead className="sticky top-0 z-20 drop-shadow-2xl">
                       {/* Source group headers */}
-                      <tr className="bg-[#1a2418] text-[#C0FE72] text-[10px] uppercase tracking-widest">
+                      <tr className="bg-[#1a2418] text-[#C0FE72] text-[10px] uppercase tracking-widest relative">
                         <th className="px-3 py-1 text-center border-r border-white/10">#</th>
                         <th colSpan={4} className="px-3 py-1 text-center border-r border-white/10">📋 Keyword Planner</th>
                         <th colSpan={4} className="px-3 py-1 text-center border-r border-white/10">📈 Google Trends</th>
@@ -2606,15 +2911,23 @@ const Dashboard = () => {
                       </tr>
                     </thead>
                     <tbody>
-                      {consolidatedResults.map((row, idx) => {
+                      {filteredConsolidatedResults.map((row, idx) => {
                         const scoreColor = (s: number) =>
                           s >= 70 ? 'text-green-400' : s >= 40 ? 'text-yellow-300' : 'text-red-400';
                         const fmtNum = (v: any, prefix = '', suffix = '', decimals = 0) =>
                           v !== null && v !== undefined && v !== '-' && Number(v) !== 0
                             ? `${prefix}${Number(v).toFixed(decimals)}${suffix}` : '-';
                         const str = (v: any) => (v && v !== '-' ? String(v) : '-');
+                        const isSelected = selectedRowIndex === idx;
                         return (
-                          <tr key={idx} className={`border-b border-white/5 hover:bg-white/5 transition-colors ${idx % 2 !== 0 ? 'bg-black/10' : ''}`}>
+                          <tr
+                            key={idx}
+                            onClick={() => setSelectedRowIndex(isSelected ? null : idx)}
+                            className={`transition-colors cursor-pointer relative ${isSelected
+                                ? 'bg-[#C0FE72]/20 outline outline-2 outline-[#C0FE72] z-10'
+                                : `border-b border-white/5 hover:bg-white/5 ${idx % 2 !== 0 ? 'bg-black/10' : ''}`
+                              }`}
+                          >
                             {/* Rank */}
                             <td className="px-3 py-2 font-bold text-[#C0FE72] whitespace-nowrap border-r border-white/10">{row.rank}</td>
                             {/* KWP */}
@@ -2634,7 +2947,21 @@ const Dashboard = () => {
                                 : '-'}
                             </td>
                             {/* Amazon */}
-                            <td className="px-3 py-2 text-gray-200 max-w-[220px] truncate" title={row.amazon_title}>{str(row.amazon_title)}</td>
+                            <td className="px-3 py-2 text-gray-200 max-w-[220px] truncate" title={row.amazon_title}>
+                              {row.asin && row.asin !== '-' ? (
+                                <a
+                                  href={`https://www.amazon.com/dp/${row.asin}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="hover:text-blue-400 hover:underline transition-colors"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {str(row.amazon_title)}
+                                </a>
+                              ) : (
+                                str(row.amazon_title)
+                              )}
+                            </td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.amazon_price_usd, '$', '', 2)}</td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{row.reviews_count ? Number(row.reviews_count).toLocaleString() : '-'}</td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.rating, '', '★', 1)}</td>
@@ -2668,6 +2995,22 @@ const Dashboard = () => {
                     </tbody>
                   </table>
                 </div>
+
+                {/* Sticky Horizontal Scrollbar overlay */}
+                <div
+                  ref={stickyScrollContainerRef}
+                  onScroll={handleStickyScroll}
+                  className="sticky bottom-0 z-50 overflow-x-auto w-full transition-opacity duration-200 custom-scrollbar mt-1 bg-[#1a2418]/90 backdrop-blur border-t border-[#C0FE72]/30"
+                  style={{
+                    opacity: showStickyScroll ? 1 : 0,
+                    pointerEvents: showStickyScroll ? 'auto' : 'none',
+                    paddingBottom: '2px', // space for grabbing
+                    paddingTop: '3px'
+                  }}
+                >
+                  <div ref={stickyScrollContentRef} style={{ height: '1px' }} />
+                </div>
+
               </div>
             )}
 

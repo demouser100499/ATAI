@@ -6,6 +6,8 @@ const DATA_DIR = join(process.cwd(), 'data');
 const PRESETS_FILE = join(DATA_DIR, 'presets.json');
 
 type PresetData = {
+  searchingMode?: string;
+  productCategory?: string;
   location: string;
   trendPeriod: string;
   variantLimitMax: string;
@@ -59,9 +61,16 @@ export async function POST(request: NextRequest) {
 
     if (body.action === 'save_new') {
       const nextCounter = store.counter + 1;
+      
+      let nextPresetNum = 1;
+      const existingNames = new Set(store.list.map(p => p.name));
+      while (existingNames.has(`Preset ${nextPresetNum}`)) {
+        nextPresetNum++;
+      }
+
       const newPreset: PresetSlot = {
         id: nextCounter,
-        name: `Preset ${nextCounter}`,
+        name: `Preset ${nextPresetNum}`,
         data: body.data,
       };
       store.list.push(newPreset);
