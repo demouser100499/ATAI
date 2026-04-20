@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchKeywordsFromPlanner } from "@/lib/step-function";
+import { logger } from "@/lib/logger";
 
 export async function POST(request: NextRequest) {
     try {
@@ -13,6 +14,8 @@ export async function POST(request: NextRequest) {
             );
         }
 
+        logger.info(`Generating keywords | Category: ${category} | Geo: ${geo || 'US'} | Limit: ${limit || 50}`);
+
         const keywords = await fetchKeywordsFromPlanner(
             category,
             geo || "US",
@@ -21,13 +24,15 @@ export async function POST(request: NextRequest) {
             search_volume_max
         );
 
+        logger.info(`Keywords generated | Category: ${category} | Count: ${keywords.length}`);
+
         return NextResponse.json({
             success: true,
             keywords: keywords.length > 0 ? keywords : [category]
         });
 
     } catch (error: unknown) {
-        console.error("Generate Keywords API Error:", error);
+        logger.error("Generate Keywords API Error", error);
         return NextResponse.json(
             { error: (error as Error).message || "Failed to generate keywords" },
             { status: 500 }

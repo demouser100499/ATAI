@@ -1016,26 +1016,41 @@ const Dashboard = () => {
     setConsolidatedResults(ranked);
   }, [amazonResults, alibabaResults, keywordPlannerResults, trendsResults]);
 
-  // Apply UI filters to the consolidated list dynamically
+  // Apply UI filters to the consolidated list dynamically.
+  // IMPORTANT: Filters only reject rows that HAVE real matched data outside the range.
+  // Rows with null/unmatched marketplace data always pass through — unmatched is not the same as "bad data".
   const filteredConsolidatedResults = useMemo(() => {
     return consolidatedResults.filter(row => {
-      // Amazon Filters
-      if (amazonFilters) {
-        if (priceMin > 0 && row.amazon_price_usd !== null && row.amazon_price_usd < priceMin) return false;
-        if (priceMax > 0 && row.amazon_price_usd !== null && row.amazon_price_usd > priceMax) return false;
-        if (reviewsMin > 0 && row.reviews_count !== null && row.reviews_count < reviewsMin) return false;
-        if (reviewsMax > 0 && row.reviews_count !== null && row.reviews_count > reviewsMax) return false;
-        if (ratingFilter > 0 && row.rating !== null && row.rating < ratingFilter) return false;
+      // Amazon Filters — only apply when this row has a matched Amazon product
+      if (amazonFilters && row.amazon_price_usd !== null) {
+        if (priceMin > 0 && row.amazon_price_usd < priceMin) return false;
+        if (priceMax > 0 && row.amazon_price_usd > priceMax) return false;
       }
-      
-      // Alibaba Filters
+      if (amazonFilters && row.reviews_count !== null && row.reviews_count !== undefined) {
+        if (reviewsMin > 0 && row.reviews_count < reviewsMin) return false;
+        if (reviewsMax > 0 && row.reviews_count > reviewsMax) return false;
+      }
+      if (amazonFilters && row.rating !== null && row.rating !== undefined) {
+        if (ratingFilter > 0 && row.rating < ratingFilter) return false;
+      }
+
+      // Alibaba Filters — only apply when this row has matched Alibaba data
       if (alibabaFilters) {
-        if (costBelow > 0 && row.amazon_price_usd !== null && row.alibaba_price_min_usd !== null) {
+        if (
+          costBelow > 0 &&
+          row.amazon_price_usd !== null &&
+          row.alibaba_price_min_usd !== null
+        ) {
           const expectedMaxPrice = row.amazon_price_usd * (1 - costBelow);
           if (row.alibaba_price_min_usd > expectedMaxPrice) return false;
         }
-        if (moq && row.moq !== null && row.moq > parseInt(moq)) return false;
-        if (alibabaRating > 0 && row.supplier_rating !== null && row.supplier_rating < alibabaRating) return false;
+        if (moq && row.moq !== null && row.moq !== undefined) {
+          if (row.moq > parseInt(moq)) return false;
+        }
+        if (alibabaRating > 0 && row.supplier_rating !== null && row.supplier_rating !== undefined) {
+          if (row.supplier_rating < alibabaRating) return false;
+        }
+        // verified_supplier: only reject if explicitly false (not null/undefined)
         if (verifiedSupplier && row.verified_supplier === false) return false;
       }
       return true;
@@ -2852,7 +2867,11 @@ const Dashboard = () => {
                       <span className="w-2 h-2 rounded-full bg-green-400" />
                       SUCCEEDED
                     </span>
-                    <span className="text-sm text-gray-300">{consolidatedResults.length} rows</span>
+                    <span className="text-sm text-gray-300">
+                      {filteredConsolidatedResults.length !== consolidatedResults.length
+                        ? <>{filteredConsolidatedResults.length} <span className="text-gray-500">/ {consolidatedResults.length} rows</span></>
+                        : <>{consolidatedResults.length} rows</>}
+                    </span>
                   </div>
                 </div>
 
@@ -2864,6 +2883,17 @@ const Dashboard = () => {
                   <span><strong className="text-[#C0FE72]">Supplier</strong> 10% · Alibaba rating + low MOQ</span>
                   <span><strong className="text-[#C0FE72]">Price</strong> 10% · Amazon price relative to others</span>
                 </div>
+
+                {/* Warning: filters hiding all rows */}
+                {filteredConsolidatedResults.length === 0 && consolidatedResults.length > 0 && (
+                  <div className="mb-4 px-4 py-3 bg-orange-500/15 border border-orange-400/40 rounded flex items-center gap-3">
+                    <span className="text-orange-400 text-lg">⚠️</span>
+                    <div>
+                      <p className="text-orange-300 text-sm font-semibold">All {consolidatedResults.length} rows are hidden by active filters</p>
+                      <p className="text-orange-200/70 text-xs mt-0.5">Relax your Amazon or Alibaba filters to reveal results. Note: filters only apply to rows with matched marketplace data.</p>
+                    </div>
+                  </div>
+                )}
 
                 {/* Scrollable container referencing the mainTableScrollRef */}
                 <div
