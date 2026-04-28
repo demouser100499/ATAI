@@ -5,7 +5,14 @@ import { logger } from "@/lib/logger";
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json();
-        const { category, geo, limit, search_volume_min, search_volume_max } = body;
+        const {
+            category,
+            geo,
+            limit,
+            search_volume_min,
+            search_volume_max,
+            blacklist
+        } = body;
 
         if (!category) {
             return NextResponse.json(
@@ -21,7 +28,8 @@ export async function POST(request: NextRequest) {
             geo || "US",
             limit || 50,
             search_volume_min,
-            search_volume_max
+            search_volume_max,
+            blacklist || []
         );
 
         logger.info(`Keywords generated | Category: ${category} | Count: ${keywords.length}`);
