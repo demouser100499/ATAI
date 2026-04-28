@@ -178,7 +178,8 @@ export async function fetchKeywordsFromPlanner(
     geo: string,
     limit: number,
     minSearches?: number,
-    maxSearches?: number
+    maxSearches?: number,
+    blacklisted_words: string[] = []
 ): Promise<string[]> {
     const CATEGORY_KEYWORD_FUNCTION = "arn:aws:lambda:eu-north-1:894037914878:function:category_keyword";
     const payload: Record<string, unknown> = {
@@ -187,6 +188,9 @@ export async function fetchKeywordsFromPlanner(
         limit,
         ...(minSearches != null && minSearches > 0 && { min_searches: minSearches }),
         ...(maxSearches != null && maxSearches > 0 && { max_searches: maxSearches }),
+        ...(blacklisted_words.length > 0 && {
+            blacklisted_words
+        }),
     };
 
     console.log("[category_keyword Lambda] Invoking for category=", category, "geo=", geo, "limit=", limit);
@@ -271,7 +275,7 @@ export async function startPipelineExecution(keyword: string, filters: PipelineF
 
             const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
             const execution_details: { keyword: string; run_id: string; execution_arn: string }[] = [];
-            
+
             const variant_keywords = keywords.slice(0, variant_limit);
             for (let i = 0; i < variant_keywords.length; i++) {
                 const kw = variant_keywords[i];

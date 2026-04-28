@@ -134,7 +134,7 @@ const Dashboard = () => {
     function handleClickOutside(event: MouseEvent) {
       // Don't close if we are actively editing a name or if the click is inside the dropdown
       if (editingPresetId !== null) return;
-      
+
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
         setPresetDropdownOpen(false);
         setIsCreatingNewPreset(false);
@@ -215,7 +215,7 @@ const Dashboard = () => {
     const d = slot.data;
     // Signal the searchingMode effect to skip its reset on this mode change
     isLoadingPresetRef.current = true;
-    
+
     // Safety reset to ensure the ref doesn't stick if searchingMode is identical
     setTimeout(() => { isLoadingPresetRef.current = false; }, 100);
 
@@ -405,10 +405,10 @@ const Dashboard = () => {
   }, [isClient, consolidatedResults, pipelineStatus]);
   // ────────────────────────────────────────────────────────────────────────
 
-  // Check if fields should be disabled (after successful pipeline completion)
-  // KEYWORD SEARCH and LOCATION should remain enabled
-  const pipelineFieldsDisabled = pipelineStatus === 'COMPLETED'; // For VARIANT LIMIT MAX, RESULTS CAP MAX, TREND PERIOD
-  const fieldsDisabled = false; // KEYWORD SEARCH and LOCATION are never disabled
+  const isActiveRun = isLoading || pipelineStatus === 'STARTING' || pipelineStatus === 'POLLING' || isBatching;
+  // Check if fields should be disabled (during and after pipeline execution)
+  const fieldsDisabled = isActiveRun;
+  const pipelineFieldsDisabled = isActiveRun || pipelineStatus === 'COMPLETED';
 
   // Helper: currently a passthrough – stage data is already scoped per execution ARN.
   const filterStageRowsByVariant = useCallback(
@@ -418,108 +418,38 @@ const Dashboard = () => {
     []
   );
 
-  // Export current pipeline execution's stage data (KWP, Trends, Amazon, Alibaba) as a single Excel file with one sheet per stage.
+  // Export current consolidated results as a single Excel file.
   const handleExportCsv = useCallback(async () => {
-    if (pipelineStatus !== 'COMPLETED') return;
-
-    // Determine which execution ARN to export:
-    // - MANUAL / ATAI AUTO: use main executionArn
-    // - CATEGORY BASED: use the selected variant's execution_arn, or first child execution (never parent executionArn — stage data is per child)
-    let arnToUse: string | null = null;
-    if (searchingMode === 'CATEGORY BASED') {
-      const selectedExec =
-        selectedCategoryVariant && selectedCategoryVariant !== 'ALL'
-          ? categoryExecutions.find((e) => e.keyword === selectedCategoryVariant)
-          : categoryExecutions[0];
-      arnToUse = selectedExec?.execution_arn ?? null;
-    } else {
-      arnToUse = executionArn;
-    }
-
-    if (!arnToUse) {
-      console.warn('No execution ARN available for export.');
-      return;
-    }
+    if (pipelineStatus !== 'COMPLETED' || consolidatedResults.length === 0) return;
 
     try {
       const wb = XLSX.utils.book_new();
 
-      const [kwpRes, trendsRes, amzRes, aliRes] = await Promise.all([
-        fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToUse)}`),
-        fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToUse)}`),
-        fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToUse)}`),
-        fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToUse)}`),
-      ]);
-
-      const parse = async (res: Response): Promise<any[] | null> => {
-        if (!res.ok) return null;
-        const data = await res.json() as { success?: boolean; available?: boolean; results?: any[] };
-        if (data.success && data.available && Array.isArray(data.results) && data.results.length > 0) {
-          return data.results;
-        }
-        return null;
-      };
-
-      const [kwpRows, trendsRows, amzRows, aliRows] = await Promise.all([
-        parse(kwpRes),
-        parse(trendsRes),
-        parse(amzRes),
-        parse(aliRes),
-      ]);
-
-      // ── Sheet 1: Consolidated Results (always first if present)
-      if (consolidatedResults.length > 0) {
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(consolidatedResults), 'Consolidated Results');
-      }
-
-      if (kwpRows?.length) {
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(kwpRows), 'Keyword Planner');
-      }
-      if (trendsRows?.length) {
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(trendsRows), 'Google Trends');
-      }
-      if (amzRows?.length) {
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(amzRows), 'Amazon');
-      }
-      if (aliRows?.length) {
-        XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(aliRows), 'Alibaba');
-      }
-
-      const sheetCount = wb.SheetNames.length;
-      if (sheetCount === 0) {
-        console.warn('No stage data available to export for ARN', arnToUse);
-        return;
-      }
+      // Export only the consolidated results shown in the main table
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(consolidatedResults), 'Consolidated Results');
 
       const now = new Date();
-      const datePart = `${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
+      const timestamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}`;
 
-      let baseKeyword: string;
+      let baseName: string;
       if (searchingMode === 'CATEGORY BASED') {
-        if (selectedCategoryVariant && selectedCategoryVariant !== 'ALL') {
-          baseKeyword = selectedCategoryVariant;
-        } else if (categoryExecutions[0]?.keyword) {
-          baseKeyword = categoryExecutions[0].keyword;
-        } else {
-          baseKeyword = 'category';
-        }
+        baseName = productCategory && productCategory !== 'All categories' ? productCategory : 'category';
       } else {
-        baseKeyword = keywordSearch || 'search';
+        baseName = keywordSearch || 'search';
       }
 
-      const safeKeyword =
-        baseKeyword
-          .trim()
-          .replace(/[\\/:*?"<>|]+/g, '')
-          .replace(/\s+/g, '_') || 'search';
+      const safeBaseName = baseName
+        .trim()
+        .replace(/[\\/:*?"<>|]+/g, '')
+        .replace(/\s+/g, '_') || 'export';
 
-      const fileName = `${safeKeyword}_${datePart}.xlsx`;
+      const fileName = `${safeBaseName}_${timestamp}.xlsx`;
 
       XLSX.writeFile(wb, fileName);
     } catch (err) {
       console.error('Error exporting Excel:', err);
     }
-  }, [pipelineStatus, searchingMode, selectedCategoryVariant, categoryExecutions, executionArn, keywordSearch]);
+  }, [pipelineStatus, consolidatedResults, searchingMode, productCategory, keywordSearch]);
 
   // Info button component with tooltip
   const InfoButton = ({ message }: { message: string }) => {
@@ -1100,6 +1030,8 @@ const Dashboard = () => {
       setPipelineStatus('FAILED');
       setStatusMessage('ABORTED');
       setIsLoading(false);
+      setIsBatching(false);
+      setIsPreliminary(false);
       return;
     }
 
@@ -1139,6 +1071,8 @@ const Dashboard = () => {
     setPipelineStatus('FAILED');
     setStatusMessage('ABORTED');
     setIsLoading(false);
+    setIsBatching(false);
+    setIsPreliminary(false);
   };
 
   const getApiParams = useCallback(() => {
@@ -1361,7 +1295,8 @@ const Dashboard = () => {
               geo: searchLocation,
               limit: variantLimitMax ? parseInt(variantLimitMax) : 50,
               search_volume_min: kwpMinSearches ? parseInt(kwpMinSearches) : undefined,
-              search_volume_max: kwpMaxSearches ? parseInt(kwpMaxSearches) : undefined
+              search_volume_max: kwpMaxSearches ? parseInt(kwpMaxSearches) : undefined,
+              blacklist: blacklistedWords.length > 0 ? blacklistedWords : []
             })
           });
 
@@ -1954,9 +1889,10 @@ const Dashboard = () => {
               <input
                 type="text"
                 value={searchingFilters}
+                disabled={fieldsDisabled}
                 onChange={(e) => setSearchingFilters(e.target.value)}
                 placeholder="SEARCHING FILTERS:"
-                className="w-full h-10 text-white text-base bg-transparent border-none outline-none placeholder-gray-400 font-semibold tracking-widest"
+                className={`w-full h-10 text-white text-base bg-transparent border-none outline-none placeholder-gray-400 font-semibold tracking-widest ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
               />
             </div>
           </div>
@@ -1996,9 +1932,10 @@ const Dashboard = () => {
           <div className="flex items-center justify-end gap-3">
             <span className="text-sm font-medium tracking-wide">ACTIVE SEARCH</span>
             <button
-              onClick={() => handleActiveSearchToggle(!activeSearch)}
+              onClick={() => !fieldsDisabled && handleActiveSearchToggle(!activeSearch)}
+              disabled={fieldsDisabled}
               className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${activeSearch ? 'bg-[#C0FE72]' : 'bg-gray-600'
-                }`}
+                } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <span
                 className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${activeSearch ? 'translate-x-6' : 'translate-x-1'
@@ -2023,14 +1960,14 @@ const Dashboard = () => {
                       name="searchingMode"
                       value={mode}
                       checked={searchingMode === mode}
+                      disabled={fieldsDisabled}
                       onChange={(e) => setSearchingMode(e.target.value)}
-                      className="sr-only"
                       style={{ accentColor: '#F3940B' }}
                     />
                     <span className={`px-3 py-1 text-xs font-bold tracking-wider rounded-full border transition-all ${searchingMode === mode
-                        ? 'bg-[#F3940B] border-[#F3940B] text-black shadow-lg shadow-orange-900/40'
-                        : 'border-white/30 text-gray-300 hover:border-white/60 hover:text-white'
-                      }`}>{mode}</span>
+                      ? 'bg-[#F3940B] border-[#F3940B] text-black shadow-lg shadow-orange-900/40'
+                      : 'border-white/30 text-gray-300 hover:border-white/60 hover:text-white'
+                      } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}>{mode}</span>
                   </label>
                 ))}
               </div>
@@ -2064,8 +2001,9 @@ const Dashboard = () => {
                     <label className="text-xs font-bold tracking-widest text-gray-400 uppercase">PRODUCT CATEGORY <span className="text-[#F3940B]">*</span></label>
                     <select
                       value={productCategory}
+                      disabled={fieldsDisabled}
                       onChange={(e) => setProductCategory(e.target.value)}
-                      className="w-full px-4 py-2.5 text-black bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40"
+                      className={`w-full px-4 py-2.5 text-black bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                     >
                       {GT_CATEGORIES.map((cat) => (
                         <option key={cat} value={cat}>{cat}</option>
@@ -2187,10 +2125,11 @@ const Dashboard = () => {
                       <span className="max-w-[150px] truncate" title={word}>{word}</span>
                       <button
                         onClick={(e) => {
+                          if (fieldsDisabled) return;
                           e.stopPropagation();
                           setBlacklistedWords(prev => prev.filter((_, i) => i !== index));
                         }}
-                        className="text-gray-500 hover:text-red-500 rounded-full w-4 h-4 flex items-center justify-center font-bold text-lg leading-none shrink-0 pb-1"
+                        className={`text-gray-500 hover:text-red-500 rounded-full w-4 h-4 flex items-center justify-center font-bold text-lg leading-none shrink-0 pb-1 ${fieldsDisabled ? 'opacity-30 cursor-not-allowed' : ''}`}
                         title="Remove word"
                       >
                         &times;
@@ -2200,6 +2139,7 @@ const Dashboard = () => {
                   <input
                     id="blacklist-input"
                     type="text"
+                    disabled={fieldsDisabled}
                     value={blacklistInput}
                     onChange={(e) => {
                       const val = e.target.value;
@@ -2266,8 +2206,9 @@ const Dashboard = () => {
                       min="0"
                       max="100"
                       value={googleTrendScore}
+                      disabled={fieldsDisabled}
                       onChange={(e) => setGoogleTrendScore(Number(e.target.value))}
-                      className="w-full h-2 bg-gray-300 rounded-full appearance-none cursor-pointer"
+                      className={`w-full h-2 bg-gray-300 rounded-full appearance-none ${fieldsDisabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
                       style={{
                         background: `linear-gradient(to right, #10b981 0%, #10b981 ${googleTrendScore}%, #d1d5db ${googleTrendScore}%, #d1d5db 100%)`,
                         WebkitAppearance: 'none',
@@ -2312,10 +2253,10 @@ const Dashboard = () => {
                     type="number"
                     min="0"
                     value={kwpMinSearches}
+                    disabled={fieldsDisabled}
                     onChange={(e) => setKwpMinSearches(e.target.value)}
                     placeholder="e.g. 1000"
-
-                    className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
+                    className={`w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500 ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                   />
                 </div>
                 <span className="text-gray-300 mt-5">–</span>
@@ -2325,9 +2266,10 @@ const Dashboard = () => {
                     type="number"
                     min="0"
                     value={kwpMaxSearches}
+                    disabled={fieldsDisabled}
                     onChange={(e) => setKwpMaxSearches(e.target.value)}
                     placeholder="e.g. 50000"
-                    className="w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500"
+                    className={`w-full px-3 py-2 text-black bg-[#FFFFFF] border border-gray-600 focus:outline-none focus:border-blue-500 ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                   />
                 </div>
               </div>
@@ -2345,9 +2287,10 @@ const Dashboard = () => {
             <h3 className="text-[#F3940B] font-bold tracking-wider text-sm">AMAZON FILTERS</h3>
             {/* Toggle switch */}
             <button
-              onClick={() => setAmazonFilters(!amazonFilters)}
+              onClick={() => !fieldsDisabled && setAmazonFilters(!amazonFilters)}
+              disabled={fieldsDisabled}
               className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${amazonFilters ? 'bg-[#F3940B]' : 'bg-gray-600'
-                }`}
+                } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <span
                 className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${amazonFilters ? 'translate-x-6' : 'translate-x-1'
@@ -2366,8 +2309,8 @@ const Dashboard = () => {
                   type="text"
                   value={priceMin}
                   onChange={(e) => setPriceMin(Number(e.target.value) || 0)}
-                  disabled={!amazonFilters}
-                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${!amazonFilters
+                  disabled={!amazonFilters || fieldsDisabled}
+                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${(!amazonFilters || fieldsDisabled)
                     ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
                     : 'bg-white text-black focus:outline-none focus:border-blue-500'
                     }`}
@@ -2377,8 +2320,8 @@ const Dashboard = () => {
                   type="text"
                   value={priceMax}
                   onChange={(e) => setPriceMax(Number(e.target.value) || 0)}
-                  disabled={!amazonFilters}
-                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${!amazonFilters
+                  disabled={!amazonFilters || fieldsDisabled}
+                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${(!amazonFilters || fieldsDisabled)
                     ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
                     : 'bg-white text-black focus:outline-none focus:border-blue-500'
                     }`}
@@ -2394,8 +2337,8 @@ const Dashboard = () => {
                   type="text"
                   value={reviewsMin}
                   onChange={(e) => setReviewsMin(Number(e.target.value) || 0)}
-                  disabled={!amazonFilters}
-                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${!amazonFilters
+                  disabled={!amazonFilters || fieldsDisabled}
+                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${(!amazonFilters || fieldsDisabled)
                     ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
                     : 'bg-white text-black focus:outline-none focus:border-blue-500'
                     }`}
@@ -2405,8 +2348,8 @@ const Dashboard = () => {
                   type="text"
                   value={reviewsMax}
                   onChange={(e) => setReviewsMax(Number(e.target.value) || 0)}
-                  disabled={!amazonFilters}
-                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${!amazonFilters
+                  disabled={!amazonFilters || fieldsDisabled}
+                  className={`w-12 h-6 px-2 py-1 text-center rounded border text-xs ${(!amazonFilters || fieldsDisabled)
                     ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
                     : 'bg-white text-black focus:outline-none focus:border-blue-500'
                     }`}
@@ -2421,11 +2364,11 @@ const Dashboard = () => {
                   <span
                     key={star}
                     title={star === ratingFilter ? 'Click to clear' : `${star}★ and above`}
-                    className={`text-lg ${!amazonFilters
+                    className={`text-lg ${(!amazonFilters || fieldsDisabled)
                       ? 'cursor-not-allowed text-gray-400'
                       : `cursor-pointer ${star <= ratingFilter ? 'text-yellow-400' : 'text-gray-500'}`
                       }`}
-                    onClick={amazonFilters ? () => setRatingFilter(star === ratingFilter ? 0 : star) : undefined}
+                    onClick={(amazonFilters && !fieldsDisabled) ? () => setRatingFilter(star === ratingFilter ? 0 : star) : undefined}
                   >
                     ★
                   </span>
@@ -2452,8 +2395,8 @@ const Dashboard = () => {
                   step="0.01"
                   value={fcl}
                   onChange={(e) => setFcl(Number(e.target.value))}
-                  disabled={!amazonFilters}
-                  className={`w-20 h-2 bg-gray-300 rounded-lg appearance-none ${!amazonFilters ? 'cursor-not-allowed' : 'cursor-pointer'
+                  disabled={!amazonFilters || fieldsDisabled}
+                  className={`w-20 h-2 bg-gray-300 rounded-lg appearance-none ${(!amazonFilters || fieldsDisabled) ? 'cursor-not-allowed' : 'cursor-pointer'
                     }`}
                   style={amazonFilters ? {
                     background: `linear-gradient(to right, #1e40af 0%, #1e40af ${fcl * 100}%, #d1d5db ${fcl * 100}%, #d1d5db 100%)`,
@@ -2498,9 +2441,10 @@ const Dashboard = () => {
             <h3 className="text-blue-400 font-bold tracking-wider text-sm">ALIBABA SUPPLIER FILTERS</h3>
             {/* Toggle switch */}
             <button
-              onClick={() => setAlibabaFilters(!alibabaFilters)}
+              onClick={() => !fieldsDisabled && setAlibabaFilters(!alibabaFilters)}
+              disabled={fieldsDisabled}
               className={`relative inline-flex h-6 w-11 items-center rounded-full transition-all duration-200 focus:outline-none shadow-inner ${alibabaFilters ? 'bg-blue-500' : 'bg-gray-600'
-                }`}
+                } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <span
                 className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out shadow-sm ${alibabaFilters ? 'translate-x-6' : 'translate-x-1'
@@ -2520,8 +2464,8 @@ const Dashboard = () => {
                   step="0.01"
                   value={costBelow}
                   onChange={(e) => setCostBelow(Number(e.target.value))}
-                  disabled={!alibabaFilters}
-                  className={`w-20 h-2 bg-gray-300 rounded-lg appearance-none ${!alibabaFilters ? 'cursor-not-allowed' : 'cursor-pointer'
+                  disabled={!alibabaFilters || fieldsDisabled}
+                  className={`w-20 h-2 bg-gray-300 rounded-lg appearance-none ${(!alibabaFilters || fieldsDisabled) ? 'cursor-not-allowed' : 'cursor-pointer'
                     }`}
                   style={alibabaFilters ? {
                     background: `linear-gradient(to right, #1e40af 0%, #1e40af ${costBelow * 100}%, #d1d5db ${costBelow * 100}%, #d1d5db 100%)`,
@@ -2564,8 +2508,8 @@ const Dashboard = () => {
                 type="text"
                 value={moq}
                 onChange={(e) => setMoq(e.target.value)}
-                disabled={!alibabaFilters}
-                className={`w-24 h-6 px-2 py-1 text-center border text-xs ${!alibabaFilters
+                disabled={!alibabaFilters || fieldsDisabled}
+                className={`w-24 h-6 px-2 py-1 text-center border text-xs ${(!alibabaFilters || fieldsDisabled)
                   ? 'text-gray-500 bg-gray-300 cursor-not-allowed'
                   : 'text-black bg-white focus:outline-none focus:border-blue-500'
                   }`}
@@ -2579,11 +2523,11 @@ const Dashboard = () => {
                   <span
                     key={star}
                     title={star === alibabaRating ? 'Click to clear' : `${star}★ and above`}
-                    className={`text-lg ${!alibabaFilters
+                    className={`text-lg ${(!alibabaFilters || fieldsDisabled)
                       ? 'cursor-not-allowed text-gray-400'
                       : `cursor-pointer ${star <= alibabaRating ? 'text-yellow-400' : 'text-gray-500'}`
                       }`}
-                    onClick={alibabaFilters ? () => setAlibabaRating(star === alibabaRating ? 0 : star) : undefined}
+                    onClick={(alibabaFilters && !fieldsDisabled) ? () => setAlibabaRating(star === alibabaRating ? 0 : star) : undefined}
                   >
                     ★
                   </span>
@@ -2604,15 +2548,15 @@ const Dashboard = () => {
               <span className={`text-xs font-bold tracking-widest uppercase ${!alibabaFilters ? 'text-gray-500' : 'text-gray-300'}`}>Verified Supplier:</span>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={alibabaFilters ? () => setVerifiedSupplier(!verifiedSupplier) : undefined}
-                  disabled={!alibabaFilters}
-                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none ${!alibabaFilters
+                  onClick={() => !fieldsDisabled && setVerifiedSupplier(!verifiedSupplier)}
+                  disabled={!alibabaFilters || fieldsDisabled}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none ${!alibabaFilters || fieldsDisabled
                     ? 'bg-gray-400 cursor-not-allowed'
                     : `${verifiedSupplier ? 'bg-green-500' : 'bg-gray-300'}`
                     }`}
                 >
                   <span
-                    className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${!alibabaFilters
+                    className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${!alibabaFilters || fieldsDisabled
                       ? 'translate-x-1'
                       : verifiedSupplier ? 'translate-x-5' : 'translate-x-1'
                       }`}
@@ -2628,7 +2572,6 @@ const Dashboard = () => {
 
         {/* ── Preset System + Bottom Action Bar ─────────────────────────── */}
         {(() => {
-          const isActiveRun = isLoading || pipelineStatus === 'STARTING' || pipelineStatus === 'POLLING' || isBatching;
           return (
             <div className="flex flex-col sm:flex-row gap-3 justify-center items-center mt-4">
 
@@ -2770,8 +2713,8 @@ const Dashboard = () => {
                 onClick={handleExportCsv}
                 disabled={isActiveRun || pipelineStatus !== 'COMPLETED'}
                 className={`px-7 py-2.5 rounded-lg font-bold tracking-wide transition-all text-sm ${!isActiveRun && pipelineStatus === 'COMPLETED'
-                    ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/40'
-                    : 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
+                  ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/40'
+                  : 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
                   }`}
               >
                 ⬇ EXPORT CSV
@@ -2781,8 +2724,8 @@ const Dashboard = () => {
                 onClick={handleSearch}
                 disabled={isActiveRun || !!variantLimitMaxError}
                 className={`px-10 py-2.5 font-bold tracking-wider rounded-lg transition-all text-sm ${isActiveRun || variantLimitMaxError
-                    ? 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
-                    : 'bg-[#F3940B] text-black hover:bg-[#e8860a] shadow-lg shadow-orange-900/40'
+                  ? 'bg-gray-700/60 text-gray-400 cursor-not-allowed border border-white/10'
+                  : 'bg-[#F3940B] text-black hover:bg-[#e8860a] shadow-lg shadow-orange-900/40'
                   }`}
               >
                 {isActiveRun ? '⟳ SEARCHING...' : '⬛ SEARCH'}
@@ -2792,8 +2735,8 @@ const Dashboard = () => {
                 onClick={handleStopSearch}
                 disabled={!isActiveRun}
                 className={`px-7 py-2.5 font-bold tracking-wide rounded-lg transition-all text-sm ${isActiveRun
-                    ? 'bg-red-700 text-white hover:bg-red-600 shadow-lg shadow-red-900/40'
-                    : 'bg-gray-700/60 text-gray-400 opacity-50 cursor-not-allowed border border-white/10'
+                  ? 'bg-red-700 text-white hover:bg-red-600 shadow-lg shadow-red-900/40'
+                  : 'bg-gray-700/60 text-gray-400 opacity-50 cursor-not-allowed border border-white/10'
                   }`}
               >
                 ✕ STOP CURRENT SEARCH
@@ -2852,7 +2795,7 @@ const Dashboard = () => {
                   ref={mainTableScrollRef}
                   onScroll={handleMainTableScroll}
                 >
-                  <table className="w-full border-separate border-spacing-0 bg-[#2a3627] text-sm">
+                  <table className="min-w-full border-separate border-spacing-0 bg-[#2a3627] text-sm">
                     <thead className="sticky top-0 z-20 drop-shadow-2xl">
                       {/* Source group headers */}
                       <tr className="bg-[#1a2418] text-[#C0FE72] text-[10px] uppercase tracking-widest relative">
@@ -2888,7 +2831,7 @@ const Dashboard = () => {
                         <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Compet.</th>
                         <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Supplier</th>
                         <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Price</th>
-                        <th className="px-3 py-2 font-bold whitespace-nowrap text-xs uppercase">Final Score</th>
+                        <th className="pl-3 pr-8 py-2 font-bold whitespace-nowrap text-xs uppercase text-left">Final Score</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2905,8 +2848,8 @@ const Dashboard = () => {
                             key={idx}
                             onClick={() => setSelectedRowIndex(isSelected ? null : idx)}
                             className={`transition-colors cursor-pointer relative ${isSelected
-                                ? 'bg-[#C0FE72]/20 outline outline-2 outline-[#C0FE72] z-10'
-                                : `border-b border-white/5 hover:bg-white/5 ${idx % 2 !== 0 ? 'bg-black/10' : ''}`
+                              ? 'bg-[#C0FE72]/20 outline outline-2 outline-[#C0FE72] z-10'
+                              : `border-b border-white/5 hover:bg-white/5 ${idx % 2 !== 0 ? 'bg-black/10' : ''}`
                               }`}
                           >
                             {/* Rank */}
@@ -2959,7 +2902,7 @@ const Dashboard = () => {
                             <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.supplier_score)}`}>{row.supplier_score}</td>
                             <td className={`px-3 py-2 font-bold text-center whitespace-nowrap ${scoreColor(row.price_score)}`}>{row.price_score}</td>
                             {/* Final score with progress bar */}
-                            <td className="px-3 py-2 whitespace-nowrap">
+                            <td className="pl-3 pr-8 py-2 whitespace-nowrap">
                               <div className="flex items-center gap-2">
                                 <div className="w-14 h-2 bg-white/10 rounded-full overflow-hidden">
                                   <div
@@ -2996,7 +2939,7 @@ const Dashboard = () => {
             )}
 
             {/* ── NO DATA PASSED FILTERS – empty state after pipeline completes ── */}
-            {pipelineStatus === 'COMPLETED' && consolidatedResults.length === 0 && hasLoadedKeywordPlanner && (
+            {pipelineStatus === 'COMPLETED' && !isLoading && consolidatedResults.length === 0 && hasLoadedKeywordPlanner && (!keywordPlannerResults || keywordPlannerResults.length === 0) && (
               <div className="mt-6 mb-10 p-6 bg-[#2a3627] rounded border border-orange-400/40 text-center">
                 <div className="text-4xl mb-3">🔍</div>
                 <p className="text-lg font-bold text-orange-300 mb-2">No data passed the current filters</p>
