@@ -323,6 +323,7 @@ const Dashboard = () => {
 
   // For CATEGORY BASED mode: currently selected category variant keyword filter
   const [selectedCategoryVariant, setSelectedCategoryVariant] = useState<string>('ALL');
+  const [isVariantFetching, setIsVariantFetching] = useState(false);
 
   // When in CATEGORY BASED mode and user selects a specific keyword, use that execution's ARN for stage data (Keyword Planner, Trends, Amazon, Alibaba)
   const effectiveStageArn = useMemo(() => {
@@ -1608,6 +1609,9 @@ const Dashboard = () => {
     setHasLoadedTrends(false);
     setHasLoadedAmazon(false);
     setHasLoadedAlibaba(false);
+    if (newValue !== 'ALL') {
+      setIsVariantFetching(true);
+    }
   }, []);
 
   // In category mode, when pipeline is completed (or polling), fetch that keyword's stage data
@@ -1688,6 +1692,10 @@ const Dashboard = () => {
           console.debug('Fetch aborted for variant:', selected);
         } else {
           console.error('Error fetching variant stage data:', err);
+        }
+      } finally {
+        if (!signal.aborted) {
+          setIsVariantFetching(false);
         }
       }
     };
@@ -3130,6 +3138,14 @@ const Dashboard = () => {
                 )}
                 {/* Keyword Planner Stage Summary */}
                 {(() => {
+                  if (isVariantFetching && !hasLoadedKeywordPlanner) {
+                    return (
+                      <div className="mb-8 flex flex-col items-center justify-center py-16 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/20 animate-pulse">
+                        <div className="w-10 h-10 border-4 border-[#C0FE72] border-t-transparent rounded-full animate-spin mb-4" />
+                        <p className="text-[#C0FE72] text-sm font-bold tracking-widest uppercase">Fetching Keyword Planner Data...</p>
+                      </div>
+                    );
+                  }
                   const displayRows = filterStageRowsByVariant(keywordPlannerResults, ['root_keyword', 'sub_keyword', 'keyword'], 'root_keyword');
                   if (!displayRows || displayRows.length === 0) return null;
                   return (
@@ -3172,6 +3188,14 @@ const Dashboard = () => {
 
                 {/* Google Trends Stage Summary */}
                 {(() => {
+                  if (isVariantFetching && !hasLoadedTrends) {
+                    return (
+                      <div className="mb-8 flex flex-col items-center justify-center py-16 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/20 animate-pulse">
+                        <div className="w-10 h-10 border-4 border-[#C0FE72] border-t-transparent rounded-full animate-spin mb-4" />
+                        <p className="text-[#C0FE72] text-sm font-bold tracking-widest uppercase">Fetching Google Trends Data...</p>
+                      </div>
+                    );
+                  }
                   const displayRows = filterStageRowsByVariant(trendsResults, ['keyword'], 'keyword');
                   if (!displayRows || displayRows.length === 0) return null;
                   return (
@@ -3220,6 +3244,14 @@ const Dashboard = () => {
 
                 {/* Amazon Marketplace Stage */}
                 {(() => {
+                  if (isVariantFetching && !hasLoadedAmazon) {
+                    return (
+                      <div className="mb-8 flex flex-col items-center justify-center py-16 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/20 animate-pulse">
+                        <div className="w-10 h-10 border-4 border-[#C0FE72] border-t-transparent rounded-full animate-spin mb-4" />
+                        <p className="text-[#C0FE72] text-sm font-bold tracking-widest uppercase">Fetching Amazon Stage Data...</p>
+                      </div>
+                    );
+                  }
                   const displayRows = filterStageRowsByVariant(amazonResults, ['keyword', 'search_category'], 'keyword');
                   if (!displayRows || displayRows.length === 0) return null;
                   return (
@@ -3262,6 +3294,14 @@ const Dashboard = () => {
 
                 {/* Alibaba Marketplace Stage */}
                 {(() => {
+                  if (isVariantFetching && !hasLoadedAlibaba) {
+                    return (
+                      <div className="mb-8 flex flex-col items-center justify-center py-16 bg-[#2a3627] rounded shadow-xl border border-[#C0FE72]/20 animate-pulse">
+                        <div className="w-10 h-10 border-4 border-[#C0FE72] border-t-transparent rounded-full animate-spin mb-4" />
+                        <p className="text-[#C0FE72] text-sm font-bold tracking-widest uppercase">Fetching Alibaba Stage Data...</p>
+                      </div>
+                    );
+                  }
                   const displayRows = filterStageRowsByVariant(alibabaResults, ['keyword', 'search_category'], 'keyword');
                   if (!displayRows || displayRows.length === 0) return null;
                   return (
