@@ -295,7 +295,7 @@ const Dashboard = () => {
   const [isPreliminary, setIsPreliminary] = useState(false);
   const [hasPerformedSearch, setHasPerformedSearch] = useState(false);
   const [consolidatedResults, setConsolidatedResults] = useState<any[]>([]);
-  const [categoryExecutions, setCategoryExecutions] = useState<{ keyword: string, run_id: string, execution_arn: string, status?: string }[]>([]);
+  const [categoryExecutions, setCategoryExecutions] = useState<{ keyword: string, run_id: string, execution_arn: string, status?: string, started_at?: number | null }[]>([]);
   const categoryExecutionsRef = useRef(categoryExecutions);
   useEffect(() => {
     categoryExecutionsRef.current = categoryExecutions;
@@ -1027,6 +1027,12 @@ const Dashboard = () => {
           fetch(`/api/pipeline/stop?arn=${encodeURIComponent(exec.execution_arn)}`, { method: 'POST' }).catch(() => { });
         }
       });
+      setCategoryExecutions(prev => prev.map(exec => {
+        if (exec.status === 'PENDING' || exec.status === 'STARTING' || exec.status === 'RUNNING') {
+          return { ...exec, status: 'ABORTED' };
+        }
+        return exec;
+      }));
       setPipelineStatus('FAILED');
       setStatusMessage('ABORTED');
       setIsLoading(false);
@@ -1184,13 +1190,25 @@ const Dashboard = () => {
       if (!variantLimitMax.trim()) {
         setVariantLimitMaxError('Variant Limit Max is required');
         hasErrors = true;
-      } else if (parseInt(variantLimitMax.trim(), 10) > 30) {
-        setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
-        hasErrors = true;
+      } else {
+        const vMax = parseInt(variantLimitMax.trim(), 10);
+        if (isNaN(vMax) || vMax <= 0) {
+          setVariantLimitMaxError('Must be greater than 0');
+          hasErrors = true;
+        } else if (vMax > 30) {
+          setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
+          hasErrors = true;
+        }
       }
       if (!resultsCap.trim()) {
         setResultsCapError('Results Cap Max is required');
         hasErrors = true;
+      } else {
+        const rCap = parseInt(resultsCap.trim(), 10);
+        if (isNaN(rCap) || rCap <= 0) {
+          setResultsCapError('Must be greater than 0');
+          hasErrors = true;
+        }
       }
       if (!trendPeriod.trim()) {
         setTrendPeriodError('Trend Period is required');
@@ -1313,7 +1331,8 @@ const Dashboard = () => {
             keyword: kw,
             run_id: '',
             execution_arn: '',
-            status: 'PENDING'
+            status: 'PENDING',
+            started_at: null
           }));
           setCategoryExecutions(initialExecutions);
           setCategoryKeywordsPreview(generatedKeywords);
@@ -1363,7 +1382,7 @@ const Dashboard = () => {
 
               setCategoryExecutions(prev => {
                 const next = [...prev];
-                next[i] = { ...next[i], status: 'STARTING' };
+                next[i] = { ...next[i], status: 'STARTING', started_at: Date.now() };
                 return next;
               });
 
@@ -1602,21 +1621,23 @@ const Dashboard = () => {
     const arnToFetch = exec?.execution_arn ?? null;
     if (!arnToFetch) return;
 
-    let cancelled = false;
-    const fetchStagesForVariant = async () => {
+    const controller = new AbortController();
+    let timeoutId: NodeJS.Timeout | null = null;
+
+    const fetchStagesForVariant = async (signal: AbortSignal) => {
       try {
         const [kwpRes, trendsRes, amzRes, aliRes] = await Promise.all([
-          fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToFetch)}`),
-          fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToFetch)}`),
-          amazonFilters ? fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToFetch)}`) : Promise.resolve(null),
-          alibabaFilters ? fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToFetch)}`) : Promise.resolve(null),
+          fetch(`/api/pipeline/keyword-planner?arn=${encodeURIComponent(arnToFetch)}`, { signal }),
+          fetch(`/api/pipeline/google-trends?arn=${encodeURIComponent(arnToFetch)}`, { signal }),
+          amazonFilters ? fetch(`/api/pipeline/amazon?arn=${encodeURIComponent(arnToFetch)}`, { signal }) : Promise.resolve(null),
+          alibabaFilters ? fetch(`/api/pipeline/alibaba?arn=${encodeURIComponent(arnToFetch)}`, { signal }) : Promise.resolve(null),
         ]);
 
-        if (cancelled) return;
+        if (signal.aborted) return;
 
         if (kwpRes?.ok) {
           const kwpData = await kwpRes.json();
-          if (!cancelled) {
+          if (!signal.aborted) {
             if (kwpData.success && kwpData.available && kwpData.results?.length > 0) {
               setKeywordPlannerResults(kwpData.results);
             }
@@ -1628,7 +1649,7 @@ const Dashboard = () => {
         }
         if (trendsRes?.ok) {
           const trendsData = await trendsRes.json();
-          if (!cancelled) {
+          if (!signal.aborted) {
             if (trendsData.success && trendsData.available && trendsData.results?.length > 0) {
               setTrendsResults(trendsData.results);
             }
@@ -1640,7 +1661,7 @@ const Dashboard = () => {
         }
         if (amzRes?.ok) {
           const amzData = await amzRes.json();
-          if (!cancelled) {
+          if (!signal.aborted) {
             if (amzData.success && amzData.available && amzData.results?.length > 0) {
               setAmazonResults(amzData.results);
             }
@@ -1652,7 +1673,7 @@ const Dashboard = () => {
         }
         if (aliRes?.ok) {
           const aliData = await aliRes.json();
-          if (!cancelled) {
+          if (!signal.aborted) {
             if (aliData.success && aliData.available && aliData.results?.length > 0) {
               setAlibabaResults(aliData.results);
             }
@@ -1662,12 +1683,24 @@ const Dashboard = () => {
             setHasLoadedAlibaba(true);
           }
         }
-      } catch (e) {
-        if (!cancelled) console.error("Error fetching stage data for category variant:", e);
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          console.debug('Fetch aborted for variant:', selected);
+        } else {
+          console.error('Error fetching variant stage data:', err);
+        }
       }
     };
-    fetchStagesForVariant();
-    return () => { cancelled = true; };
+
+    // Small debounce to avoid hammering server while scrolling through variants
+    timeoutId = setTimeout(() => {
+      fetchStagesForVariant(controller.signal);
+    }, 250);
+
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      controller.abort();
+    };
   }, [searchingMode, pipelineStatus, selectedCategoryVariant, categoryExecutions, amazonFilters, alibabaFilters]);
 
   // Polling Effect for Pipeline
@@ -1694,9 +1727,17 @@ const Dashboard = () => {
             if (childStatusCounter >= 3) {
               childStatusCounter = 0;
               const updatedExecutions = await Promise.all(categoryExecutions.map(async (exec) => {
-                // Ignore ones that haven't been assigned an ARN yet or are already finished
-                if (exec.status === 'PENDING' || exec.status === 'STARTING' || !exec.execution_arn) return exec;
                 if (exec.status === 'SUCCEEDED' || exec.status === 'FAILED' || exec.status === 'ABORTED' || exec.status === 'TIMED_OUT') return exec;
+
+                // Check for frontend timeout (e.g., 5 minutes)
+                const now = Date.now();
+                if (exec.started_at && (now - exec.started_at > 5 * 60 * 1000) && (exec.status === 'RUNNING' || exec.status === 'STARTING')) {
+                  console.warn(`Execution for ${exec.keyword} timed out after 5 minutes.`);
+                  return { ...exec, status: 'TIMED_OUT' };
+                }
+
+                // Ignore ones that haven't been assigned an ARN yet
+                if (exec.status === 'PENDING' || exec.status === 'STARTING' || !exec.execution_arn) return exec;
 
                 try {
                   const res = await fetch(`/api/pipeline/status?arn=${exec.execution_arn}`);
@@ -1954,20 +1995,23 @@ const Dashboard = () => {
               <div className="flex items-center gap-5 flex-wrap">
                 <span className="text-xs font-bold tracking-widest text-gray-400 uppercase">SEARCHING MODE:</span>
                 {['MANUAL', 'CATEGORY BASED', 'ATAI AUTO'].map((mode) => (
-                  <label key={mode} className="flex items-center gap-2 cursor-pointer">
+                  <label key={mode} className={`flex items-center gap-2 ${fieldsDisabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
                     <input
                       type="radio"
                       name="searchingMode"
                       value={mode}
                       checked={searchingMode === mode}
-                      disabled={fieldsDisabled}
-                      onChange={(e) => setSearchingMode(e.target.value)}
+                      disabled={fieldsDisabled && searchingMode !== mode}
+                      onChange={(e) => {
+                        if (!fieldsDisabled) setSearchingMode(e.target.value);
+                      }}
                       style={{ accentColor: '#F3940B' }}
+                      className={fieldsDisabled ? "pointer-events-none" : ""}
                     />
                     <span className={`px-3 py-1 text-xs font-bold tracking-wider rounded-full border transition-all ${searchingMode === mode
-                      ? 'bg-[#F3940B] border-[#F3940B] text-black shadow-lg shadow-orange-900/40'
-                      : 'border-white/30 text-gray-300 hover:border-white/60 hover:text-white'
-                      } ${fieldsDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}>{mode}</span>
+                      ? 'bg-[#F3940B] border-[#F3940B] text-black ' + (fieldsDisabled ? '' : 'shadow-lg shadow-orange-900/40')
+                      : 'border-white/30 text-gray-300 ' + (fieldsDisabled ? '' : 'hover:border-white/60 hover:text-white')
+                      } ${(fieldsDisabled && searchingMode !== mode) ? 'opacity-50' : ''}`}>{mode}</span>
                   </label>
                 ))}
               </div>
@@ -2071,11 +2115,17 @@ const Dashboard = () => {
                         onChange={(e) => {
                           const val = e.target.value;
                           setVariantLimitMax(val);
-                          const parsed = parseInt(val.trim(), 10);
-                          if (parsed > 30) {
-                            setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
-                          } else if (variantLimitMaxError) {
-                            setVariantLimitMaxError('');
+                          if (!val.trim()) {
+                            setVariantLimitMaxError('Variant Limit Max is required');
+                          } else {
+                            const parsed = parseInt(val.trim(), 10);
+                            if (isNaN(parsed) || parsed <= 0) {
+                              setVariantLimitMaxError('Must be greater than 0');
+                            } else if (parsed > 30) {
+                              setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
+                            } else if (variantLimitMaxError) {
+                              setVariantLimitMaxError('');
+                            }
                           }
                         }}
                         className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${variantLimitMaxError ? 'border-red-500' : 'border-gray-300'
@@ -2095,9 +2145,17 @@ const Dashboard = () => {
                         value={resultsCap}
                         disabled={pipelineFieldsDisabled}
                         onChange={(e) => {
-                          setResultsCap(e.target.value);
-                          if (resultsCapError) {
-                            setResultsCapError('');
+                          const val = e.target.value;
+                          setResultsCap(val);
+                          if (!val.trim()) {
+                            setResultsCapError('Results Cap Max is required');
+                          } else {
+                            const parsed = parseInt(val.trim(), 10);
+                            if (isNaN(parsed) || parsed <= 0) {
+                              setResultsCapError('Must be greater than 0');
+                            } else if (resultsCapError) {
+                              setResultsCapError('');
+                            }
                           }
                         }}
                         className={`w-full px-4 py-2.5 text-black bg-white border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#F3940B]/40 ${resultsCapError ? 'border-red-500' : 'border-gray-300'
