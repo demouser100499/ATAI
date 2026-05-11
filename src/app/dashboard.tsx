@@ -154,7 +154,7 @@ const Dashboard = () => {
       .then((stored: { list: PresetSlot[]; counter: number }) => {
         setPresets(stored.list || []);
         setPresetCounter(stored.counter || 0);
-        if (stored.list?.length > 0) setSelectedPresetId(stored.list[0].id);
+        // Do NOT automatically select the first preset on load
       })
       .catch(e => console.error('Failed to load presets', e));
   }, []);
@@ -254,7 +254,7 @@ const Dashboard = () => {
       const updated = presets.filter(p => p.id !== id);
       setPresets(updated);
       if (selectedPresetId === id) {
-        setSelectedPresetId(updated.length > 0 ? updated[updated.length - 1].id : null);
+        setSelectedPresetId(null);
       }
     } catch (e) {
       console.error('Failed to delete preset', e);
@@ -577,6 +577,7 @@ const Dashboard = () => {
 
   const handleReset = useCallback(() => {
     setSearchingFilters('');
+    setSelectedPresetId(null);
     setLocation('');
     setActiveSearch(true);
     setSearchingMode('MANUAL');
@@ -928,6 +929,8 @@ const Dashboard = () => {
         supplier_rating: supplierRating || null,
         supplier_country: supplierCountry,
         ali_category: aliCategory,
+        alibaba_product_id: aliMatch?.product_id || null,
+        product_link: aliMatch?.product_link || null,
         verified_supplier: aliMatch?.verified_supplier === true || aliMatch?.verified_supplier === 'true',
         // Scores
         demand_score: demandScore,
@@ -1193,8 +1196,8 @@ const Dashboard = () => {
         hasErrors = true;
       } else {
         const vMax = parseInt(variantLimitMax.trim(), 10);
-        if (isNaN(vMax) || vMax <= 0) {
-          setVariantLimitMaxError('Must be greater than 0');
+        if (isNaN(vMax)) {
+          setVariantLimitMaxError('Must be a number');
           hasErrors = true;
         } else if (vMax > 30) {
           setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
@@ -1206,8 +1209,8 @@ const Dashboard = () => {
         hasErrors = true;
       } else {
         const rCap = parseInt(resultsCap.trim(), 10);
-        if (isNaN(rCap) || rCap <= 0) {
-          setResultsCapError('Must be greater than 0');
+        if (isNaN(rCap)) {
+          setResultsCapError('Must be a number');
           hasErrors = true;
         }
       }
@@ -2127,8 +2130,8 @@ const Dashboard = () => {
                             setVariantLimitMaxError('Variant Limit Max is required');
                           } else {
                             const parsed = parseInt(val.trim(), 10);
-                            if (isNaN(parsed) || parsed <= 0) {
-                              setVariantLimitMaxError('Must be greater than 0');
+                            if (isNaN(parsed)) {
+                              setVariantLimitMaxError('Must be a number');
                             } else if (parsed > 30) {
                               setVariantLimitMaxError('Limit max to 30 to prevent Google Trends rate limiting');
                             } else if (variantLimitMaxError) {
@@ -2159,8 +2162,8 @@ const Dashboard = () => {
                             setResultsCapError('Results Cap Max is required');
                           } else {
                             const parsed = parseInt(val.trim(), 10);
-                            if (isNaN(parsed) || parsed <= 0) {
-                              setResultsCapError('Must be greater than 0');
+                            if (isNaN(parsed)) {
+                              setResultsCapError('Must be a number');
                             } else if (resultsCapError) {
                               setResultsCapError('');
                             }
@@ -2652,7 +2655,7 @@ const Dashboard = () => {
                     ? <span className="text-green-400">✓ SAVED</span>
                     : selectedPresetId !== null && presets.find(p => p.id === selectedPresetId)
                       ? presets.find(p => p.id === selectedPresetId)!.name
-                      : 'PRESETS'}
+                      : 'Templates'}
                   <svg className={`w-3 h-3 transition-transform ${presetDropdownOpen ? 'rotate-180' : ''}`} fill="currentColor" viewBox="0 0 20 20">
                     <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
                   </svg>
@@ -2957,7 +2960,21 @@ const Dashboard = () => {
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.rating, '', '★', 1)}</td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap border-r border-white/10">{str(row.bestseller_rank)}</td>
                             {/* Alibaba */}
-                            <td className="px-3 py-2 text-gray-200 max-w-[180px] truncate" title={row.alibaba_title}>{str(row.alibaba_title)}</td>
+                            <td className="px-3 py-2 text-gray-200 max-w-[180px] truncate" title={row.alibaba_title}>
+                              {row.product_link || row.alibaba_product_id ? (
+                                <a
+                                  href={row.product_link || `https://www.alibaba.com/product-detail/product_${row.alibaba_product_id}.html`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="hover:text-blue-400 hover:underline transition-colors"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {str(row.alibaba_title)}
+                                </a>
+                              ) : (
+                                str(row.alibaba_title)
+                              )}
+                            </td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{row.moq ? Number(row.moq).toLocaleString() : '-'}</td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap">{fmtNum(row.supplier_rating, '', '★', 1)}</td>
                             <td className="px-3 py-2 text-gray-100 whitespace-nowrap border-r border-white/10">{str(row.supplier_country)}</td>
@@ -3942,7 +3959,7 @@ const Dashboard = () => {
               )
             }
             {
-              searchingMode !== 'CATEGORY BASED' && products.length === 0 && !isLoading && !error && hasPerformedSearch && (
+              searchingMode !== 'CATEGORY BASED' && products.length === 0 && consolidatedResults.length === 0 && !isLoading && !error && hasPerformedSearch && (
                 <div className="flex flex-col items-center justify-center min-h-[300px] bg-[#32402F] rounded-lg border border-white/20">
                   <div className="text-center">
                     <p className="text-[#C0FE72] text-4xl font-bold mb-4">NO RESULTS FOUND</p>

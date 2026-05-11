@@ -39,10 +39,14 @@ export async function POST(request: NextRequest) {
             keywords: keywords.length > 0 ? keywords : [category]
         });
 
-    } catch (error: unknown) {
+    } catch (error: any) {
         logger.error("Generate Keywords API Error", error);
         return NextResponse.json(
-            { error: (error as Error).message || "Failed to generate keywords" },
+            {
+                error: error.message || "Failed to generate keywords",
+                stack: process.env.NODE_ENV !== 'production' ? error.stack : undefined,
+                cause: error.cause
+            },
             { status: 500 }
         );
     }
